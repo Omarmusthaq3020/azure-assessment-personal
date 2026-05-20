@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual Environment (DO NOT COMMIT)
+Lib/
+Scripts/
+pyvenv.cfg
+Include/
+
+# Python Debug/Test Files
+get-pip.py
+credential_function.py
+test_auth_endpoints.py
+backend/check_headings.py
+backend/debug_headings.py
+backend/debug_scraper.py
+
+# Node.js / Frontend
+node_modules/
+dist/
+build/
+.npm
+.eslintcache
+package-lock.json
+
+# Azure / Docker
+.azure/
+*.tfstate
+*.tfstate.backup
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Generated Reports & Data
+*.xlsx
+*.csv
+*.log
+*.tar
+data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~

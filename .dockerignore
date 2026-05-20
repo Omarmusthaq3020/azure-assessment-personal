@@ -1,0 +1,8 @@
+node_modules
+__pycache__
+.git
+.env
+venv
+frontend/node_modules
+backend/__pycache__
+*.xlsx

@@ -1,0 +1,19 @@
+services:
+  app:
+    build: .
+    image: codex-gcp:latest
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - AZURE_OPENAI_ENDPOINT=https://azure-migration-open-ai.openai.azure.com/
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+      - AZURE_OPENAI_DEPLOYMENT_NAME=gpt-5.4-mini
+      - GCP_OAUTH_CLIENT_ID=
+      - GCP_OAUTH_CLIENT_SECRET=
+      - GCP_OAUTH_REDIRECT_URI=http://localhost:8000/gcp-oauth-callback
+    volumes:
+      # Mount the current directory to /app/data so generated files persist locally if needed
+      # Note: The app currently writes to the current working directory.
+      # In Docker, this is /app.
+      - ./data:/app/data
