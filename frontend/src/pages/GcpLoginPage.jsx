@@ -107,7 +107,7 @@ export default function GcpLoginPage() {
                     credentials_json: event.target.result
                 }));
                 setError('');
-            } catch (_err) {
+            } catch {
                 setError('Invalid JSON file. Please upload a valid service account key.');
             }
         };
@@ -134,17 +134,6 @@ export default function GcpLoginPage() {
             setOauthLoading(false);
             setError(err.response?.data?.detail || 'Failed to start Google sign-in.');
         }
-    };
-
-    const handleProjectSelect = (projectId) => {
-        navigate('/assessment', {
-            state: {
-                gcpCredentials: {
-                    project_id: projectId,
-                    gcp_session_id: sessionId
-                }
-            }
-        });
     };
 
     const handleServiceAccountLogin = async (e) => {

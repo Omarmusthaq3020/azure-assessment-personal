@@ -4,7 +4,7 @@ import axios from 'axios';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import ProgressIndicator from '../components/ProgressIndicator';
-import MermaidDiagram from '../components/MermaidDiagram';
+import DrawioViewer from '../components/DrawioViewer';
 
 export default function AssessmentPage() {
     const [formData, setFormData] = useState({
@@ -23,7 +23,6 @@ export default function AssessmentPage() {
 
     // Architecture Diagram State
     const [diagramType, setDiagramType] = useState('network');
-    const [diagramCode, setDiagramCode] = useState('');
     const [drawioXml, setDrawioXml] = useState('');
     const [generatingDiagram, setGeneratingDiagram] = useState(false);
 
@@ -31,6 +30,8 @@ export default function AssessmentPage() {
     const location = useLocation();
     const navigate = useNavigate();
     const [sessionId, setSessionId] = useState(null);
+    const [tenantId, setTenantId] = useState('');
+    const [workbookMode, setWorkbookMode] = useState('combined');
     const [subscriptionIds, setSubscriptionIds] = useState([]);
     const [subscriptions, setSubscriptions] = useState([]);
     const [authMethod, setAuthMethod] = useState(null); // 'sdk' or 'az-cli'
@@ -73,6 +74,8 @@ export default function AssessmentPage() {
             setSubscriptionIds(location.state?.subscriptionIds || []);
             setSubscriptions(location.state?.subscriptions || []);
             setAuthMethod(location.state?.authMethod || 'sdk');
+            setTenantId(location.state?.tenantId || '');
+            setWorkbookMode(location.state?.workbookMode || 'combined');
             detectedType = 'azure_to_azure';
         }
 
@@ -121,7 +124,6 @@ export default function AssessmentPage() {
     const handleGenerateArchitecture = async () => {
         if (!result?.file_path) return;
         setGeneratingDiagram(true);
-        setDiagramCode('');
         setDrawioXml('');
         setError('');
         try {
@@ -130,7 +132,6 @@ export default function AssessmentPage() {
                 diagram_type: diagramType,
                 cloud_type: formData.migration_type.split('_')[0]
             });
-            setDiagramCode(response.data.diagram);
             setDrawioXml(response.data.drawio_xml || '');
         } catch (err) {
             console.error(err);
@@ -218,9 +219,19 @@ export default function AssessmentPage() {
                     setError(job.error || 'Assessment failed');
                     setLoading(false);
                     setProgress(null);
+                } else if (job.status === 'cancelled') {
+                    clearInterval(pollInterval);
+                    stopTimer();
+                    jobIdRef.current = null;
+                    setError('Assessment cancelled');
+                    setLoading(false);
+                    setProgress(null);
                 } else if (job.status === 'running' && job.progress) {
                     // Update progress while running
                     setProgress(job.progress);
+                    if (job.result?.files?.length > 0) {
+                        setResult({ ...job.result });
+                    }
                 }
                 // If running, continue polling
             } catch (err) {
@@ -237,7 +248,7 @@ export default function AssessmentPage() {
                 setError('Failed to check assessment status');
                 setLoading(false);
             }
-        }, 5000); // Poll every 5 seconds for responsive progress updates
+        }, 1000);
     };
 
     const handleRunAssessment = async (overrideType = null) => {
@@ -299,7 +310,9 @@ export default function AssessmentPage() {
                 if (authMethod === 'az-cli') {
                     response = await axios.post('/api/assess-with-cli-session', {
                         session_id: sessionId,
-                        subscription_ids: subscriptionIds.length > 0 ? subscriptionIds : null
+                        subscription_ids: subscriptionIds.length > 0 ? subscriptionIds : null,
+                        subscriptions,
+                        workbook_mode: subscriptionIds.length > 1 ? workbookMode : 'combined'
                     });
                     if (response.data.status === 'accepted') {
                         jobIdRef.current = response.data.job_id;
@@ -347,9 +360,9 @@ export default function AssessmentPage() {
         // finally block removed as it was prematurely setting loading:false for background jobs
     };
 
-    const handleDownload = () => {
-        if (result?.file_path) {
-            window.open(`/api/download?file_path=${encodeURIComponent(result.file_path)}`, '_blank');
+    const handleDownload = (filePath = result?.file_path) => {
+        if (filePath) {
+            window.open(`/api/download?file_path=${encodeURIComponent(filePath)}`, '_blank');
         }
     };
 
@@ -386,7 +399,9 @@ export default function AssessmentPage() {
                                                 state: {
                                                     sessionId: sessionId,
                                                     returnToSubscriptions: true,
-                                                    subscriptionIds: subscriptionIds
+                                                    subscriptionIds: subscriptionIds,
+                                                    tenantId,
+                                                    workbookMode
                                                 }
                                             })}
                                             className="text-xs text-blue-400 hover:text-blue-300 underline"
@@ -415,7 +430,48 @@ export default function AssessmentPage() {
                                             )}
                                         </div>
                                     </div>
+                                    {tenantId && (
+                                        <p className="mt-2 text-xs text-gray-400">
+                                            Tenant: <span className="font-mono text-gray-300">{tenantId}</span>
+                                        </p>
+                                    )}
                                 </div>
+                            )}
+
+                            {formData.migration_type === 'azure_to_azure' && subscriptionIds.length > 1 && (
+                                <fieldset className="rounded-lg border border-gray-600 bg-gray-700/50 p-3">
+                                    <legend className="px-2 text-sm font-medium text-gray-300">Workbook output</legend>
+                                    <div className="space-y-2">
+                                        <label className="flex cursor-pointer items-start gap-3 rounded-md p-2 hover:bg-gray-700">
+                                            <input
+                                                type="radio"
+                                                name="assessment-workbook-mode"
+                                                value="combined"
+                                                checked={workbookMode === 'combined'}
+                                                onChange={(event) => setWorkbookMode(event.target.value)}
+                                                className="mt-1 h-4 w-4 text-blue-600"
+                                            />
+                                            <span>
+                                                <span className="block text-sm font-medium text-white">Single workbook</span>
+                                                <span className="block text-xs text-gray-400">Combine all selected subscriptions.</span>
+                                            </span>
+                                        </label>
+                                        <label className="flex cursor-pointer items-start gap-3 rounded-md p-2 hover:bg-gray-700">
+                                            <input
+                                                type="radio"
+                                                name="assessment-workbook-mode"
+                                                value="per_subscription"
+                                                checked={workbookMode === 'per_subscription'}
+                                                onChange={(event) => setWorkbookMode(event.target.value)}
+                                                className="mt-1 h-4 w-4 text-blue-600"
+                                            />
+                                            <span>
+                                                <span className="block text-sm font-medium text-white">Multiple workbooks</span>
+                                                <span className="block text-xs text-gray-400">Create one workbook per subscription.</span>
+                                            </span>
+                                        </label>
+                                    </div>
+                                </fieldset>
                             )}
 
                             <div>
@@ -518,7 +574,14 @@ export default function AssessmentPage() {
                                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" />
                                         </svg>
                                     </div>
-                                    <h3 className="text-xl font-bold text-white">Assessment Complete!</h3>
+                                    <h3 className="text-xl font-bold text-white">
+                                        {loading ? 'Completed workbooks' : 'Assessment Complete!'}
+                                    </h3>
+                                    {loading && result.total_files && (
+                                        <p className="text-sm text-blue-300">
+                                            {result.files?.length || 0} of {result.total_files} ready. You can download completed workbooks now.
+                                        </p>
+                                    )}
                                     {result.duration && (
                                         <p className="text-gray-400 text-sm mt-1 font-medium animate-fade-in">
                                             Completed in: <span className="text-blue-400 font-bold">{result.duration}</span>
@@ -527,19 +590,48 @@ export default function AssessmentPage() {
                                     {result.status === 'warning' && (
                                         <p className="text-yellow-400 text-sm">{result.message}</p>
                                     )}
-                                    <div className="bg-gray-900 p-4 rounded-lg text-left text-sm font-mono text-gray-300 break-all">
-                                        {result.file_name}
-                                    </div>
-                                    <button
-                                        onClick={handleDownload}
-                                        className="w-full py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-medium transition shadow-lg hover:shadow-blue-500/30 flex items-center justify-center mb-3"
-                                    >
-                                        <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                                        </svg>
-                                        Download Report
-                                    </button>
+                                    {result.workbook_mode === 'per_subscription' && result.files?.length > 0 ? (
+                                        <div className="space-y-3">
+                                            {result.files.map((file) => {
+                                                const subscription = subscriptions.find(
+                                                    (item) => item.subscription_id === file.subscription_id
+                                                );
+                                                return (
+                                                    <div key={file.file_path} className="bg-gray-900 p-4 rounded-lg border border-gray-700 text-left">
+                                                        <p className="text-sm font-semibold text-white">
+                                                            {file.subscription_name || subscription?.display_name || file.subscription_id || 'Subscription report'}
+                                                        </p>
+                                                        <p className="mt-1 text-xs font-mono text-gray-400 break-all">
+                                                            {file.file_name}
+                                                        </p>
+                                                        <button
+                                                            onClick={() => handleDownload(file.file_path)}
+                                                            className="w-full mt-3 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-medium transition"
+                                                        >
+                                                            Download workbook
+                                                        </button>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    ) : (
+                                        <>
+                                            <div className="bg-gray-900 p-4 rounded-lg text-left text-sm font-mono text-gray-300 break-all">
+                                                {result.file_name || result.files?.[0]?.file_name}
+                                            </div>
+                                            <button
+                                                onClick={() => handleDownload(result.file_path || result.files?.[0]?.file_path)}
+                                                className="w-full py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-medium transition shadow-lg hover:shadow-blue-500/30 flex items-center justify-center mb-3"
+                                            >
+                                                <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                                                </svg>
+                                                Download Report
+                                            </button>
+                                        </>
+                                    )}
 
+                                    {result.file_path && <>
                                     <button
                                         onClick={handleAnalyze}
                                         disabled={analyzing}
@@ -594,6 +686,7 @@ export default function AssessmentPage() {
                                             </button>
                                         </div>
                                     </div>
+                                    </>}
                                 </div>
                             )
                         }
@@ -601,7 +694,7 @@ export default function AssessmentPage() {
                 </div >
 
                 {/* Architecture Diagram Result */}
-                {diagramCode && (
+                {drawioXml && (
                     <div className="mt-8 bg-gray-800 p-8 rounded-xl shadow-lg border border-gray-700 animate-fade-in max-w-full overflow-hidden">
                         <div className="flex items-center justify-between mb-6">
                             <div className="flex items-center">
@@ -611,13 +704,13 @@ export default function AssessmentPage() {
                                     </svg>
                                 </div>
                                 <h2 className="text-2xl font-bold text-white">
-                                    {diagramType === 'network' ? 'Network Topology' : 
-                                     diagramType === 'resource_groups' ? 'Resource Groups Overview' : 
+                                    {diagramType === 'network' ? 'Network Topology' :
+                                     diagramType === 'resource_groups' ? 'Resource Groups Overview' :
                                      'Migration Readiness'}
                                 </h2>
                             </div>
                         </div>
-                        <MermaidDiagram code={diagramCode} drawioXml={drawioXml} />
+                        <DrawioViewer xml={drawioXml} />
                     </div>
                 )}
 
@@ -638,24 +731,24 @@ export default function AssessmentPage() {
                                 <ReactMarkdown
                                     remarkPlugins={[remarkGfm]}
                                     components={{
-                                        h1: ({ node, ...props }) => <h1 className="text-white text-2xl font-semibold mt-6 mb-4 pb-2 border-b border-gray-700 break-words" {...props} />,
-                                        h2: ({ node, ...props }) => <h2 className="text-white text-xl font-semibold mt-8 mb-3 break-words" {...props} />,
-                                        h3: ({ node, ...props }) => <h3 className="text-white text-lg font-semibold mt-6 mb-2 break-words" {...props} />,
-                                        p: ({ node, ...props }) => <p className="text-gray-300 my-4 leading-7 break-words" {...props} />,
-                                        strong: ({ node, ...props }) => <strong className="text-white font-semibold break-words" {...props} />,
-                                        ul: ({ node, ...props }) => <ul className="text-gray-300 my-4 space-y-2 pl-6 list-disc break-words" {...props} />,
-                                        ol: ({ node, ...props }) => <ol className="text-gray-300 my-4 space-y-2 pl-6 list-decimal break-words" {...props} />,
-                                        li: ({ node, ...props }) => <li className="text-gray-300 leading-7 break-words" {...props} />,
-                                        table: ({ node, ...props }) => (
+                                        h1: (props) => <h1 className="text-white text-2xl font-semibold mt-6 mb-4 pb-2 border-b border-gray-700 break-words" {...props} />,
+                                        h2: (props) => <h2 className="text-white text-xl font-semibold mt-8 mb-3 break-words" {...props} />,
+                                        h3: (props) => <h3 className="text-white text-lg font-semibold mt-6 mb-2 break-words" {...props} />,
+                                        p: (props) => <p className="text-gray-300 my-4 leading-7 break-words" {...props} />,
+                                        strong: (props) => <strong className="text-white font-semibold break-words" {...props} />,
+                                        ul: (props) => <ul className="text-gray-300 my-4 space-y-2 pl-6 list-disc break-words" {...props} />,
+                                        ol: (props) => <ol className="text-gray-300 my-4 space-y-2 pl-6 list-decimal break-words" {...props} />,
+                                        li: (props) => <li className="text-gray-300 leading-7 break-words" {...props} />,
+                                        table: (props) => (
                                             <div className="overflow-x-auto my-6">
                                                 <table className="min-w-full border border-gray-700 rounded-lg" {...props} />
                                             </div>
                                         ),
-                                        thead: ({ node, ...props }) => <thead className="bg-gray-900/50" {...props} />,
-                                        tbody: ({ node, ...props }) => <tbody className="divide-y divide-gray-700" {...props} />,
-                                        tr: ({ node, ...props }) => <tr className="hover:bg-gray-800/30" {...props} />,
-                                        th: ({ node, ...props }) => <th className="px-4 py-3 text-left text-sm font-semibold text-white border-b border-gray-700 break-words" {...props} />,
-                                        td: ({ node, ...props }) => <td className="px-4 py-3 text-sm text-gray-300 break-words" {...props} />,
+                                        thead: (props) => <thead className="bg-gray-900/50" {...props} />,
+                                        tbody: (props) => <tbody className="divide-y divide-gray-700" {...props} />,
+                                        tr: (props) => <tr className="hover:bg-gray-800/30" {...props} />,
+                                        th: (props) => <th className="px-4 py-3 text-left text-sm font-semibold text-white border-b border-gray-700 break-words" {...props} />,
+                                        td: (props) => <td className="px-4 py-3 text-sm text-gray-300 break-words" {...props} />,
                                     }}
                                 >
                                     {analysis}
@@ -683,14 +776,14 @@ export default function AssessmentPage() {
                                                         <ReactMarkdown
                                                             remarkPlugins={[remarkGfm]}
                                                             components={{
-                                                                h1: ({ node, ...props }) => <h1 className="text-white text-base font-semibold mt-3 mb-2" {...props} />,
-                                                                h2: ({ node, ...props }) => <h2 className="text-white text-sm font-semibold mt-3 mb-2" {...props} />,
-                                                                h3: ({ node, ...props }) => <h3 className="text-white text-sm font-semibold mt-2 mb-1" {...props} />,
-                                                                p: ({ node, ...props }) => <p className="text-gray-200 my-2 leading-6" {...props} />,
-                                                                strong: ({ node, ...props }) => <strong className="text-white font-medium" {...props} />,
-                                                                ul: ({ node, ...props }) => <ul className="text-gray-200 my-2 space-y-1 pl-5 list-disc" {...props} />,
-                                                                ol: ({ node, ...props }) => <ol className="text-gray-200 my-2 space-y-1 pl-5 list-decimal" {...props} />,
-                                                                li: ({ node, ...props }) => <li className="text-gray-200 leading-6" {...props} />
+                                                                h1: (props) => <h1 className="text-white text-base font-semibold mt-3 mb-2" {...props} />,
+                                                                h2: (props) => <h2 className="text-white text-sm font-semibold mt-3 mb-2" {...props} />,
+                                                                h3: (props) => <h3 className="text-white text-sm font-semibold mt-2 mb-1" {...props} />,
+                                                                p: (props) => <p className="text-gray-200 my-2 leading-6" {...props} />,
+                                                                strong: (props) => <strong className="text-white font-medium" {...props} />,
+                                                                ul: (props) => <ul className="text-gray-200 my-2 space-y-1 pl-5 list-disc" {...props} />,
+                                                                ol: (props) => <ol className="text-gray-200 my-2 space-y-1 pl-5 list-decimal" {...props} />,
+                                                                li: (props) => <li className="text-gray-200 leading-6" {...props} />
                                                             }}
                                                         >
                                                             {msg.content}

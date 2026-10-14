@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
-import MermaidDiagram from '../components/MermaidDiagram';
+import DrawioViewer from '../components/DrawioViewer';
 
 export default function DiagramPlaygroundPage() {
     const navigate = useNavigate();
@@ -10,7 +10,6 @@ export default function DiagramPlaygroundPage() {
     const [cloudType, setCloudType] = useState('azure');
     const [dragOver, setDragOver] = useState(false);
     const [loading, setLoading] = useState(false);
-    const [diagramCode, setDiagramCode] = useState('');
     const [drawioXml, setDrawioXml] = useState('');
     const [error, setError] = useState('');
 
@@ -22,7 +21,6 @@ export default function DiagramPlaygroundPage() {
         }
         setSelectedFile(file);
         setError('');
-        setDiagramCode('');
         setDrawioXml('');
     };
 
@@ -41,7 +39,6 @@ export default function DiagramPlaygroundPage() {
 
         setLoading(true);
         setError('');
-        setDiagramCode('');
         setDrawioXml('');
         try {
             const form = new FormData();
@@ -52,7 +49,6 @@ export default function DiagramPlaygroundPage() {
             const response = await axios.post('/api/generate-architecture-upload', form, {
                 headers: { 'Content-Type': 'multipart/form-data' }
             });
-            setDiagramCode(response.data.diagram || '');
             setDrawioXml(response.data.drawio_xml || '');
         } catch (err) {
             setError(err.response?.data?.detail || 'Failed to generate diagram.');
@@ -147,10 +143,10 @@ export default function DiagramPlaygroundPage() {
                     )}
                 </div>
 
-                {diagramCode && (
+                {drawioXml && (
                     <div className="bg-gray-800 border border-gray-700 rounded-xl p-6">
                         <h2 className="text-xl font-semibold text-white mb-4">Generated Diagram</h2>
-                        <MermaidDiagram code={diagramCode} drawioXml={drawioXml} />
+                        <DrawioViewer xml={drawioXml} />
                     </div>
                 )}
             </div>

@@ -279,7 +279,7 @@ async def logout(session_id: str):
 # ============================================================================
 
 @router.post("/device-code-start")
-async def start_device_code_login(tenant_id: Optional[str] = None):
+def start_device_code_login(tenant_id: Optional[str] = None):
     """
     Start az login --use-device-code and return the device code and URL.
     
@@ -431,7 +431,7 @@ async def start_device_code_login(tenant_id: Optional[str] = None):
 
 
 @router.get("/device-code-status/{session_id}")
-async def check_device_code_status(session_id: str):
+def check_device_code_status(session_id: str):
     """
     Check the status of a device code authentication session.
     Works with sessions created by /device-code-start endpoint.
@@ -504,117 +504,6 @@ async def check_device_code_status(session_id: str):
         "tenant_id": session.get("tenant_id"),
         "tenant_name": session.get("tenant_name")
     }
-
-
-@router.get("/device-code-tenants/{session_id}")
-async def list_cli_tenants(session_id: str, probe_missing_tenants: bool = False):
-    """
-    List distinct tenants available in the authenticated session.
-
-    This uses a multi-step approach:
-    1. Get all tenants from 'az account tenant list'
-    2. For each tenant, try to list subscriptions
-    3. Only return tenants that have accessible subscriptions
-    """
-    if session_id not in device_code_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    session = device_code_sessions[session_id]
-
-    if session["status"] != "completed":
-        raise HTTPException(status_code=401, detail="Session not authenticated")
-
-    try:
-        custom_env = os.environ.copy()
-        if "env_dir" in session:
-            custom_env["AZURE_CONFIG_DIR"] = session["env_dir"]
-            
-        # Step 1: Get all tenants the user has access to
-        print("Fetching tenant list...")
-        tenant_result = subprocess.run(
-            ["az", "account", "tenant", "list", "--output", "json"],
-            capture_output=True, text=True, env=custom_env
-        )
-        
-        all_tenants = []
-        if tenant_result.returncode == 0:
-            try:
-                all_tenants = json.loads(tenant_result.stdout)
-            except:
-                pass
-        
-        # Step 2: Get all subscriptions from 'az account list --all'
-        result = subprocess.run(
-            ["az", "account", "list", "--all", "--output", "json"],
-            capture_output=True, text=True, env=custom_env
-        )
-        
-        subscriptions_data = []
-        if result.returncode == 0 and result.stdout:
-            try:
-                subscriptions_data = json.loads(result.stdout)
-            except Exception:
-                pass
-        
-        # Step 3: Build tenant map with subscription counts
-        tenants = {}
-        for sub in subscriptions_data:
-            t_id = sub.get("tenantId")
-            if t_id:
-                if t_id not in tenants:
-                    tenants[t_id] = {
-                        "tenant_id": t_id,
-                        "display_name": "Unknown Tenant",
-                        "subscription_count": 0
-                    }
-                tenants[t_id]["subscription_count"] += 1
-        
-        # Step 4: Enrich with display names from tenant list
-        for t in all_tenants:
-            t_id = t.get("tenantId")
-            if t_id in tenants:
-                tenants[t_id]["display_name"] = t.get("displayName", t_id)
-        
-        # Step 5: Include tenants with zero subscriptions (and optional explicit probe)
-        for t in all_tenants:
-            t_id = t.get("tenantId")
-            if t_id and t_id not in tenants:
-                name = t.get("displayName", t_id)
-                tenants[t_id] = {
-                    "tenant_id": t_id,
-                    "display_name": name if name else f"Tenant {t_id[:8]}...",
-                    "subscription_count": 0
-                }
-                
-                if probe_missing_tenants:
-                    try:
-                        tenant_sub_result = subprocess.run(
-                            ["az", "account", "list", "--query", f"[?tenantId=='{t_id}']", "--output", "json"],
-                            capture_output=True, text=True, env=custom_env, timeout=10
-                        )
-                        
-                        if tenant_sub_result.returncode == 0 and tenant_sub_result.stdout:
-                            try:
-                                tenant_subs = json.loads(tenant_sub_result.stdout)
-                                if len(tenant_subs) > 0:
-                                    tenants[t_id]["subscription_count"] = len(tenant_subs)
-                            except:
-                                pass
-                    except Exception:
-                        pass
-        
-        for t_id, t_data in tenants.items():
-            if t_data["display_name"] == "Unknown Tenant":
-                t_data["display_name"] = f"Tenant {t_id[:8]}..."
-
-        tenant_list = list(tenants.values())
-        return tenant_list
-
-    except Exception as e:
-        print(f"Error getting tenants: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to list tenants: {str(e)}")
 
 
 @router.get("/device-code-subscriptions/{session_id}")

@@ -1,17 +1,19 @@
 import { useState, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 
+const AZURE_SESSION_STORAGE_KEY = 'azure_cli_assessment_session';
+
 export default function AzCliDeviceCodeLogin() {
-    const [step, setStep] = useState('start'); // 'start', 'device-code', 'loading-tenants', 'select-tenant', 'select-subscriptions', 'completed'
+    const [step, setStep] = useState('start'); // 'start', 'device-code', 'loading-subscriptions', 'select-subscriptions'
     const [sessionId, setSessionId] = useState('');
     const [deviceCodeInfo, setDeviceCodeInfo] = useState(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState('');
     const [copied, setCopied] = useState(false);
-    const [tenants, setTenants] = useState([]);
-    const [selectedTenant, setSelectedTenant] = useState('');
+    const [tenantId, setTenantId] = useState('');
     const [subscriptions, setSubscriptions] = useState([]);
     const [selectedSubscriptions, setSelectedSubscriptions] = useState([]);
+    const [workbookMode, setWorkbookMode] = useState('combined');
 
     const navigate = useNavigate();
     const location = useLocation();
@@ -23,24 +25,63 @@ export default function AzCliDeviceCodeLogin() {
             if (location.state.subscriptionIds) {
                 setSelectedSubscriptions(location.state.subscriptionIds);
             }
-            // If we have a stored tenant ID, use it, otherwise just fetch default
             const tid = location.state.tenantId;
-            if (tid) setSelectedTenant(tid);
+            if (tid) setTenantId(tid);
+            if (location.state.workbookMode) {
+                setWorkbookMode(location.state.workbookMode);
+            }
             fetchSubscriptions(location.state.sessionId, tid);
+            return;
         }
+
+        const savedSession = sessionStorage.getItem(AZURE_SESSION_STORAGE_KEY);
+        if (!savedSession) return;
+
+        try {
+            const saved = JSON.parse(savedSession);
+            if (!saved.sessionId) return;
+
+            setSessionId(saved.sessionId);
+            setTenantId(saved.tenantId || '');
+            setSelectedSubscriptions(saved.subscriptionIds || []);
+            setWorkbookMode(saved.workbookMode || 'combined');
+            if (saved.authenticated && saved.subscriptions?.length) {
+                setSubscriptions(saved.subscriptions);
+                setStep('select-subscriptions');
+                return;
+            }
+
+            setStep('loading-subscriptions');
+            fetch(`/api/auth/device-code-status/${saved.sessionId}`)
+                .then((response) => response.ok ? response.json() : Promise.reject(new Error('Session expired')))
+                .then((status) => {
+                    if (status.status === 'completed') {
+                        fetchSubscriptions(saved.sessionId, saved.tenantId || null);
+                    } else if (status.status === 'pending' && saved.deviceCodeInfo) {
+                        setDeviceCodeInfo(saved.deviceCodeInfo);
+                        setStep('device-code');
+                        pollAuthStatus(saved.sessionId, saved.tenantId || null);
+                    } else {
+                        sessionStorage.removeItem(AZURE_SESSION_STORAGE_KEY);
+                        setStep('start');
+                    }
+                })
+                .catch(() => {
+                    sessionStorage.removeItem(AZURE_SESSION_STORAGE_KEY);
+                    setStep('start');
+                });
+        } catch {
+            sessionStorage.removeItem(AZURE_SESSION_STORAGE_KEY);
+        }
+        // The polling functions intentionally own their timer lifecycle.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [location]);
 
-    const handleStartAuth = async (tenantIdToAuth = null) => {
-        console.log('🚀 Starting CLI authentication...', tenantIdToAuth ? `for tenant ${tenantIdToAuth}` : 'for home tenant');
+    const handleStartAuth = async () => {
+        const tenantIdToAuth = tenantId.trim() || null;
         setLoading(true);
         setError('');
-        setStep('device-code');
-        setDeviceCodeInfo({
-            userCode: 'Loading...',
-            verificationUrl: 'https://microsoft.com/devicelogin',
-            message: 'Starting authentication. Fetching device code...',
-            authenticatingTenant: tenantIdToAuth
-        });
+        setDeviceCodeInfo(null);
 
         try {
             console.log('📡 Calling /api/auth/device-code-start...');
@@ -69,12 +110,19 @@ export default function AzCliDeviceCodeLogin() {
             console.log('✅ Received data:', data);
 
             setSessionId(data.session_id);
-            setDeviceCodeInfo({
+            const receivedCodeInfo = {
                 userCode: data.user_code,
                 verificationUrl: data.verification_url,
                 message: data.message,
                 authenticatingTenant: tenantIdToAuth // Track which tenant we're authenticating to
-            });
+            };
+            setDeviceCodeInfo(receivedCodeInfo);
+            setStep('device-code');
+            sessionStorage.setItem(AZURE_SESSION_STORAGE_KEY, JSON.stringify({
+                sessionId: data.session_id,
+                tenantId: tenantIdToAuth || '',
+                deviceCodeInfo: receivedCodeInfo
+            }));
 
             console.log('📋 Device Code:', data.user_code);
             console.log('🔗 Verification URL:', data.verification_url);
@@ -112,15 +160,20 @@ export default function AzCliDeviceCodeLogin() {
                 if (data.status === 'completed') {
                     completed = true;
                     cleanup(pollInterval, timeoutId, focusHandler, visibilityHandler);
-                    setStep('loading-tenants');
-
-                    if (authenticatingTenantId) {
-                        console.log(`Authenticated to tenant ${authenticatingTenantId}, fetching subscriptions...`);
-                        setSelectedTenant(authenticatingTenantId);
-                        await fetchSubscriptions(sid, authenticatingTenantId);
-                    } else {
-                        await fetchTenants(sid);
-                    }
+                    setStep('loading-subscriptions');
+                    const saved = JSON.parse(sessionStorage.getItem(AZURE_SESSION_STORAGE_KEY) || '{}');
+                    sessionStorage.setItem(AZURE_SESSION_STORAGE_KEY, JSON.stringify({
+                        ...saved,
+                        sessionId: sid,
+                        tenantId: authenticatingTenantId || '',
+                        authenticated: true
+                    }));
+                    console.log(
+                        authenticatingTenantId
+                            ? `Authenticated to tenant ${authenticatingTenantId}, fetching subscriptions...`
+                            : 'Authenticated to the default tenant, fetching subscriptions...'
+                    );
+                    await fetchSubscriptions(sid, authenticatingTenantId);
                 } else if (data.status === 'failed') {
                     completed = true;
                     cleanup(pollInterval, timeoutId, focusHandler, visibilityHandler);
@@ -135,11 +188,13 @@ export default function AzCliDeviceCodeLogin() {
         };
 
         const focusHandler = () => {
+            setStep('loading-subscriptions');
             checkStatus(pollInterval, timeoutId, focusHandler, visibilityHandler);
         };
 
         const visibilityHandler = () => {
             if (document.visibilityState === 'visible') {
+                setStep('loading-subscriptions');
                 checkStatus(pollInterval, timeoutId, focusHandler, visibilityHandler);
             }
         };
@@ -158,40 +213,6 @@ export default function AzCliDeviceCodeLogin() {
 
         await checkStatus(pollInterval, timeoutId, focusHandler, visibilityHandler);
     };
-    const fetchTenants = async (sid) => {
-        try {
-            console.log('📋 Fetching tenants...');
-            const response = await fetch(`/api/auth/device-code-tenants/${sid}`);
-
-            if (!response.ok) {
-                // If endpoint fails (e.g. old backend), fallback to fetching subscriptions directly
-                console.warn('⚠️ Fetch tenants failed, falling back to direct subscription fetch');
-                await fetchSubscriptions(sid);
-                return;
-            }
-
-            const data = await response.json();
-            console.log('✅ Tenants:', data);
-            setTenants(data);
-
-            if (data.length === 0) {
-                // No tenants explicitly found, fallback
-                await fetchSubscriptions(sid);
-            } else if (data.length === 1 && data[0].subscription_count > 0) {
-                // Only one tenant and it has subscriptions, auto-select
-                const tid = data[0].tenant_id;
-                setSelectedTenant(tid);
-                await fetchSubscriptions(sid, tid);
-            } else {
-                // Multiple tenants OR single tenant needing re-auth, let user choose
-                setStep('select-tenant');
-            }
-        } catch (err) {
-            console.error('❌ Error fetching tenants:', err);
-            await fetchSubscriptions(sid);
-        }
-    };
-
     const fetchSubscriptions = async (sid, tenantId = null) => {
         setLoading(true);
         setError('');
@@ -212,9 +233,16 @@ export default function AzCliDeviceCodeLogin() {
             const text = await response.text();
             try {
                 const subs = JSON.parse(text);
-                console.log('✅ Subscriptions:', subs);
                 setSubscriptions(subs);
                 setStep('select-subscriptions');
+                const saved = JSON.parse(sessionStorage.getItem(AZURE_SESSION_STORAGE_KEY) || '{}');
+                sessionStorage.setItem(AZURE_SESSION_STORAGE_KEY, JSON.stringify({
+                    ...saved,
+                    sessionId: sid,
+                    tenantId: tenantId || '',
+                    subscriptions: subs,
+                    authenticated: true
+                }));
             } catch (e) {
                 console.error('❌ JSON Parse Error:', e);
                 console.error('Response text was:', text);
@@ -228,30 +256,6 @@ export default function AzCliDeviceCodeLogin() {
             // setStep('start');
         } finally {
             setLoading(false);
-        }
-    };
-
-    const handleTenantSelect = async (tenantId) => {
-        const tenant = tenants.find(t => t.tenant_id === tenantId);
-
-        // Check if this tenant has subscriptions
-        if (tenant && tenant.subscription_count === 0) {
-            // This is a guest tenant that needs re-authentication
-            console.log(`🔄 Tenant ${tenantId} has 0 subscriptions, triggering re-authentication...`);
-
-            // Show confirmation to user
-            if (window.confirm(
-                `This tenant (${tenant.display_name}) requires re-authentication to access its subscriptions.\n\n` +
-                `You will receive a new device code to authenticate specifically to this tenant.\n\n` +
-                `Click OK to continue.`
-            )) {
-                // Trigger new authentication flow for this specific tenant
-                await handleStartAuth(tenantId);
-            }
-        } else {
-            // Tenant has subscriptions, proceed normally
-            setSelectedTenant(tenantId);
-            await fetchSubscriptions(sessionId, tenantId);
         }
     };
 
@@ -271,14 +275,22 @@ export default function AzCliDeviceCodeLogin() {
             selectedSubscriptions.includes(sub.subscription_id)
         );
 
+        const sessionState = {
+            authMethod: 'az-cli',
+            sessionId,
+            subscriptionIds: selectedSubscriptions,
+            subscriptions: selectedSubDetails,
+            tenantId: tenantId.trim(),
+            workbookMode: selectedSubscriptions.length > 1 ? workbookMode : 'combined'
+        };
+        sessionStorage.setItem(AZURE_SESSION_STORAGE_KEY, JSON.stringify({
+            ...sessionState,
+            subscriptions,
+            authenticated: true
+        }));
+
         navigate('/assessment', {
-            state: {
-                authMethod: 'az-cli',
-                sessionId: sessionId,
-                subscriptionIds: selectedSubscriptions,
-                subscriptions: selectedSubDetails,
-                tenantId: selectedTenant // Pass tenant ID so we can preserve state if user goes back
-            }
+            state: sessionState
         });
     };
 
@@ -315,17 +327,42 @@ export default function AzCliDeviceCodeLogin() {
                             <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
                                 <h3 className="font-semibold text-blue-900 mb-2">How it works</h3>
                                 <p className="text-sm text-blue-800">
-                                    Click the button below to start the authentication process. You'll receive a code
-                                    to enter on the Microsoft login page to securely authenticate with your Azure account.
+                                    Enter a tenant ID to authenticate directly to that tenant, or leave it blank to use
+                                    your Azure account's default tenant.
+                                </p>
+                            </div>
+
+                            <div>
+                                <label htmlFor="tenant-id" className="block text-sm font-medium text-gray-700 mb-2">
+                                    Azure Tenant ID <span className="font-normal text-gray-500">(optional)</span>
+                                </label>
+                                <input
+                                    id="tenant-id"
+                                    type="text"
+                                    value={tenantId}
+                                    onChange={(event) => setTenantId(event.target.value)}
+                                    onKeyDown={(event) => {
+                                        if (event.key === 'Enter') handleStartAuth();
+                                    }}
+                                    placeholder="00000000-0000-0000-0000-000000000000"
+                                    autoComplete="off"
+                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg font-mono text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                                />
+                                <p className="mt-2 text-xs text-gray-500">
+                                    Leave blank for the default tenant. Find a specific ID in Microsoft Entra ID under Overview → Tenant ID.
                                 </p>
                             </div>
 
                             <button
-                                onClick={() => handleStartAuth()}
+                                onClick={handleStartAuth}
                                 disabled={loading}
                                 className="w-full bg-indigo-600 text-white py-3 px-6 rounded-lg font-semibold hover:bg-indigo-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                             >
-                                {loading ? 'Starting...' : 'Start Authentication'}
+                                {loading
+                                    ? 'Requesting device code...'
+                                    : tenantId.trim()
+                                        ? 'Sign in to this tenant'
+                                        : 'Sign in with default tenant'}
                             </button>
                         </div>
                     </div>
@@ -378,28 +415,15 @@ export default function AzCliDeviceCodeLogin() {
                                 <p className="text-sm font-medium text-gray-700 mb-4">Step 2: Enter this code</p>
                                 <div className="flex items-center gap-3">
                                     <div className="flex-1 px-6 py-4 bg-white border-2 border-green-300 rounded-lg">
-                                        {deviceCodeInfo.userCode === 'Loading...' ? (
-                                            <div className="flex items-center justify-center py-2">
-                                                <div className="animate-pulse flex space-x-2">
-                                                    <div className="h-4 w-4 bg-green-400 rounded-full"></div>
-                                                    <div className="h-4 w-4 bg-green-400 rounded-full"></div>
-                                                    <div className="h-4 w-4 bg-green-400 rounded-full"></div>
-                                                </div>
-                                            </div>
-                                        ) : (
-                                            <p className="text-3xl font-mono font-bold text-center text-gray-900 tracking-wider">
-                                                {deviceCodeInfo.userCode}
-                                            </p>
-                                        )}
+                                        <p className="text-3xl font-mono font-bold text-center text-gray-900 tracking-wider">
+                                            {deviceCodeInfo.userCode}
+                                        </p>
                                     </div>
                                     <button
                                         onClick={() => copyToClipboard(deviceCodeInfo.userCode)}
-                                        disabled={deviceCodeInfo.userCode === 'Loading...'}
-                                        className={`px-4 py-2 rounded-lg transition-colors ${deviceCodeInfo.userCode === 'Loading...'
-                                            ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
-                                            : copied
-                                                ? 'bg-green-700 text-white'
-                                                : 'bg-green-600 text-white hover:bg-green-700'
+                                        className={`px-4 py-2 rounded-lg transition-colors ${copied
+                                            ? 'bg-green-700 text-white'
+                                            : 'bg-green-600 text-white hover:bg-green-700'
                                             }`}
                                     >
                                         {copied ? 'Copied!' : 'Copy'}
@@ -418,7 +442,7 @@ export default function AzCliDeviceCodeLogin() {
                 )}
 
                 {/* Post-auth transition step */}
-                {step === 'loading-tenants' && (
+                {step === 'loading-subscriptions' && (
                     <div className="bg-white rounded-2xl shadow-xl p-8">
                         <div className="text-center">
                             <div className="inline-block p-4 bg-green-100 rounded-full mb-4">
@@ -427,72 +451,15 @@ export default function AzCliDeviceCodeLogin() {
                                 </svg>
                             </div>
                             <h2 className="text-2xl font-bold text-gray-900 mb-2">Authentication Successful</h2>
-                            <p className="text-gray-600 mb-6">Loading your tenants and subscriptions...</p>
+                            <p className="text-gray-600 mb-6">
+                                {tenantId
+                                    ? `Loading subscriptions for tenant ${tenantId}...`
+                                    : 'Loading subscriptions for your default tenant...'}
+                            </p>
                             <div className="inline-flex items-center gap-2 text-gray-600">
                                 <div className="animate-spin h-5 w-5 border-2 border-indigo-600 border-t-transparent rounded-full"></div>
                                 <span>Please wait</span>
                             </div>
-                        </div>
-                    </div>
-                )}
-
-                {/* Tenant Selection Step */}
-                {step === 'select-tenant' && (
-                    <div className="bg-white rounded-2xl shadow-xl p-8">
-                        <div className="text-center mb-8">
-                            <div className="inline-block p-4 bg-blue-100 rounded-full mb-4">
-                                <svg className="w-12 h-12 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
-                                </svg>
-                            </div>
-                            <h2 className="text-2xl font-bold text-gray-900 mb-2">Select Tenant</h2>
-                            <p className="text-gray-600">Please choose which organization's resources you want to assess</p>
-                        </div>
-
-                        {error && (
-                            <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
-                                {error}
-                            </div>
-                        )}
-
-                        {loading && (
-                            <div className="text-center mb-4">
-                                <div className="inline-flex items-center gap-2 text-indigo-600">
-                                    <div className="animate-spin h-5 w-5 border-2 border-indigo-600 border-t-transparent rounded-full"></div>
-                                    <span>Fetching subscriptions...</span>
-                                </div>
-                            </div>
-                        )}
-
-                        <div className="space-y-4">
-                            {tenants.map((tenant) => (
-                                <button
-                                    key={tenant.tenant_id}
-                                    onClick={() => handleTenantSelect(tenant.tenant_id)}
-                                    className="w-full flex items-center justify-between p-4 bg-white border-2 border-gray-200 rounded-xl hover:border-blue-500 hover:bg-blue-50 transition-all group"
-                                >
-                                    <div className="flex flex-col items-start">
-                                        <span className="font-semibold text-gray-900 group-hover:text-blue-700">{tenant.display_name}</span>
-                                        <span className="text-sm text-gray-500 group-hover:text-blue-600">{tenant.tenant_id}</span>
-                                    </div>
-                                    <div className="flex items-center gap-3">
-                                        <div className="text-right mr-2">
-                                            {tenant.subscription_count > 0 ? (
-                                                <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800 border border-green-200">
-                                                    {tenant.subscription_count} Subscription(s)
-                                                </span>
-                                            ) : (
-                                                <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-800 border border-amber-200">
-                                                    Action Required
-                                                </span>
-                                            )}
-                                        </div>
-                                        <svg className="w-5 h-5 text-gray-400 group-hover:text-blue-500 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                                        </svg>
-                                    </div>
-                                </button>
-                            ))}
                         </div>
                     </div>
                 )}
@@ -509,15 +476,9 @@ export default function AzCliDeviceCodeLogin() {
                             <h2 className="text-2xl font-bold text-gray-900 mb-2">Select Subscriptions</h2>
                             <p className="text-gray-600">Choose which subscriptions to assess</p>
 
-                            {/* Option to go back to tenants if multiple tenants exist */}
-                            {tenants.length > 1 && (
-                                <button
-                                    onClick={() => setStep('select-tenant')}
-                                    className="mt-2 text-sm text-indigo-600 hover:text-indigo-800 underline"
-                                >
-                                    ← Change Tenant ({tenants.find(t => t.tenant_id === selectedTenant)?.display_name || 'Selected'})
-                                </button>
-                            )}
+                            <p className="mt-2 text-xs text-gray-500">
+                                {tenantId ? `Tenant: ${tenantId}` : 'Default tenant'}
+                            </p>
                         </div>
 
                         <div className="space-y-4">
@@ -576,6 +537,42 @@ export default function AzCliDeviceCodeLogin() {
                                 ))}
                             </div>
 
+                            {selectedSubscriptions.length > 1 && (
+                                <fieldset className="mt-6 border border-gray-200 rounded-xl p-4">
+                                    <legend className="px-2 text-sm font-semibold text-gray-800">Workbook output</legend>
+                                    <div className="space-y-3">
+                                        <label className="flex items-start gap-3 cursor-pointer">
+                                            <input
+                                                type="radio"
+                                                name="workbook-mode"
+                                                value="combined"
+                                                checked={workbookMode === 'combined'}
+                                                onChange={(event) => setWorkbookMode(event.target.value)}
+                                                className="mt-1 h-4 w-4 text-indigo-600"
+                                            />
+                                            <span>
+                                                <span className="block font-medium text-gray-900">One combined workbook</span>
+                                                <span className="block text-xs text-gray-500">All selected subscriptions in one report.</span>
+                                            </span>
+                                        </label>
+                                        <label className="flex items-start gap-3 cursor-pointer">
+                                            <input
+                                                type="radio"
+                                                name="workbook-mode"
+                                                value="per_subscription"
+                                                checked={workbookMode === 'per_subscription'}
+                                                onChange={(event) => setWorkbookMode(event.target.value)}
+                                                className="mt-1 h-4 w-4 text-indigo-600"
+                                            />
+                                            <span>
+                                                <span className="block font-medium text-gray-900">One workbook per subscription</span>
+                                                <span className="block text-xs text-gray-500">Generate a separate downloadable report for each subscription.</span>
+                                            </span>
+                                        </label>
+                                    </div>
+                                </fieldset>
+                            )}
+
                             <button
                                 onClick={handleProceedToAssessment}
                                 disabled={selectedSubscriptions.length === 0}
@@ -587,19 +584,6 @@ export default function AzCliDeviceCodeLogin() {
                                 }
                             </button>
                         </div>
-                    </div>
-                )}
-
-                {/* Completed Step */}
-                {step === 'completed' && (
-                    <div className="bg-white rounded-2xl shadow-xl p-8 text-center">
-                        <div className="inline-block p-4 bg-green-100 rounded-full mb-4">
-                            <svg className="w-12 h-12 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                            </svg>
-                        </div>
-                        <h2 className="text-2xl font-bold text-gray-900 mb-2">Authentication Successful!</h2>
-                        <p className="text-gray-600">Redirecting to assessment page...</p>
                     </div>
                 )}
 

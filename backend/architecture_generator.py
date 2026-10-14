@@ -7,13 +7,15 @@ to generate Mermaid architecture diagrams for visual understanding.
 Supports: Azure, AWS, GCP assessments.
 """
 
+import base64
 import json
 import os
 import sys
 import re
 from datetime import datetime
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, List, Optional
+from urllib.parse import quote
 import xml.etree.ElementTree as ET
 
 import pandas as pd
@@ -22,6 +24,99 @@ import ast
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import AzureOpenAIConfig
+
+# ---------------------------------------------------------------------------
+# Local Azure icon resolver
+# ---------------------------------------------------------------------------
+# Diagrams previously fetched icons from azureicons.com / twemoji, which was
+# unreliable (occasional wrong icon, network dependency, broken on offline /
+# air-gapped deploys). We now resolve icons from the local Azure-Icons folder
+# the user downloaded and embed them as base64 data URIs so the resulting
+# drawio XML is fully self-contained — works in the in-app playground AND
+# when the XML is opened in app.diagrams.net or desktop drawio.
+
+# Project root contains the Azure-Icons folder at the repo root level.
+_ICONS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "Azure-Icons",
+)
+
+# Override map for names where azureicons.com's path differs from the local
+# Azure-Icons folder layout, or where we want to substitute a different icon.
+# Keys are (category, name) used in code; values are local relative paths.
+_LOCAL_ICON_OVERRIDES: Dict[tuple, str] = {
+    # Microsoft's local distribution files Kubernetes under Compute, not
+    # Containers (which is azureicons.com's category).
+    ("Containers", "Kubernetes-Services"): "Compute/Kubernetes-Services.svg",
+    # Twemoji glyphs were the previous fallback; map to Azure-native icons.
+    ("Twemoji", "User"): "Identity/Users.svg",
+    ("Twemoji", "Internet"): "Networking/Public-IP-Addresses.svg",
+    ("Twemoji", "Peering"): "Other/Peerings.svg",
+}
+
+# Cache so each SVG is read + encoded only once per process.
+_ICON_DATA_URI_CACHE: Dict[str, str] = {}
+
+
+def _resolve_icon_path(category: str, name: str) -> Optional[str]:
+    """Return absolute path to the local SVG for (category, name), or None."""
+    key = (category, name)
+    if key in _LOCAL_ICON_OVERRIDES:
+        candidate = os.path.join(_ICONS_DIR, _LOCAL_ICON_OVERRIDES[key])
+        if os.path.isfile(candidate):
+            return candidate
+    candidate = os.path.join(_ICONS_DIR, category, f"{name}.svg")
+    if os.path.isfile(candidate):
+        return candidate
+    return None
+
+
+def get_icon_uri(category: str, name: str, fallback_url: str = "") -> str:
+    """Return a drawio-safe self-contained URI for the requested icon.
+
+    Looks up Azure-Icons/<category>/<name>.svg (with override map for known
+    layout differences) and returns a URL-encoded inline SVG data URI:
+    ``data:image/svg+xml,<percent-encoded-svg>``.
+
+    Why URL-encoded inline (NOT ``;base64,``):
+    drawio's style parser splits ``key=value`` pairs on ``;``. A standard
+    base64 data URI like ``data:image/svg+xml;base64,XXX`` therefore gets
+    truncated at the ``;`` between the MIME type and the ``base64``
+    indicator, so the image reference loses its actual content and the
+    icon silently fails to render. URL-encoded inline SVG has no ``;`` in
+    its structure (``,`` is the only separator), and ``urllib.parse.quote``
+    percent-encodes every ``;`` and ``=`` found inside the SVG body so
+    drawio's parser sees the URI as a single opaque value.
+
+    If the file is missing, falls back to ``fallback_url`` (the remote
+    URL) and prints a one-time warning so gaps in the local icon set are
+    visible during diagram generation.
+    """
+    cache_key = f"{category}/{name}"
+    if cache_key in _ICON_DATA_URI_CACHE:
+        return _ICON_DATA_URI_CACHE[cache_key]
+
+    path = _resolve_icon_path(category, name)
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                svg_text = fh.read()
+            # Percent-encode the SVG body so drawio's style parser cannot
+            # split it on ';' or interpret '=' as a key/value separator.
+            # ``quote`` encodes ';' as %3B, '=' as %3D, '&' as %26, etc.
+            encoded = quote(svg_text, safe="")
+            uri = f"data:image/svg+xml,{encoded}"
+            _ICON_DATA_URI_CACHE[cache_key] = uri
+            return uri
+        except OSError as e:
+            print(f"⚠️ Local icon read failed for {cache_key}: {e}. Falling back to remote.")
+
+    # Local file missing — fall back to remote URL if provided, else empty
+    # so drawio renders the box without an image (visible gap, debuggable).
+    if fallback_url:
+        print(f"⚠️ Local Azure-Icons missing {category}/{name}.svg — using remote fallback.")
+    _ICON_DATA_URI_CACHE[cache_key] = fallback_url
+    return fallback_url
 
 # ---------------------------------------------------------------------------
 # 1. Data Extraction — Parse Excel to structured JSON
@@ -179,7 +274,10 @@ def _extract_azure_summary(wb, sheet_names: list) -> dict:
         "migration_status": {},
         "resource_counts": {},
     }
-    icon_private_link = "https://www.azureicons.com/static/images/icons/Networking/svg/Private-Link-Service.svg"
+    icon_private_link = get_icon_uri(
+        "Networking", "Private-Link-Service",
+        "https://www.azureicons.com/static/images/icons/Networking/svg/Private-Link-Service.svg",
+    )
 
     # --- Resource Group summary ---
     rg_sheet = _find_sheet(sheet_names, ["RG"])
@@ -1039,12 +1137,20 @@ def _extract_aws_summary(wb, sheet_names: list) -> dict:
     if subnet_sheet:
         sub_records = _sheet_to_records(wb, subnet_sheet, max_rows=100)
         for r in sub_records:
-            name = _pick(r, "ResourceName", "Name", "SubnetId")
+            # Capture BOTH name and subnet_id. EC2 instances reference subnets
+            # by ID (subnet-xxxxx) but the friendly Name column is what we
+            # want to display, so we store both and let the renderer match
+            # on subnet_id while labelling with name.
+            name = _pick(r, "ResourceName", "Name")
+            subnet_id = _pick(r, "SubnetId")
+            if not name:
+                name = subnet_id  # fallback when no name tag
             cidr = _pick(r, "CidrBlock")
             vpc = _pick(r, "VpcId")
             az = _pick(r, "AvailabilityZone")
             summary.setdefault("subnets", []).append({
                 "name": str(name),
+                "subnet_id": str(subnet_id),
                 "cidr": str(cidr),
                 "vpc": str(vpc),
                 "az": str(az),
@@ -1105,11 +1211,23 @@ def _extract_aws_summary(wb, sheet_names: list) -> dict:
     if lb_sheet:
         lb_records = _sheet_to_records(wb, lb_sheet, max_rows=50)
         for r in lb_records:
-            name = _pick(r, "ResourceName", "Name")
-            lb_type = _pick(r, "Type", "Scheme")
+            name = _pick(r, "ResourceName", "Name", "LoadBalancerName")
+            # Capture topology-relevant fields so the renderer can place the
+            # LB inside its VPC and draw arrows to its target instances.
             summary["load_balancers"].append({
                 "name": str(name),
-                "type": str(lb_type),
+                "type": str(_pick(r, "Type")),
+                "scheme": str(_pick(r, "Scheme")),
+                "vpc": str(_pick(r, "VpcId", "Vpc Id")),
+                "dns_name": str(_pick(r, "DNSName", "DnsName", "DNS Name")),
+                "availability_zones": str(_pick(r, "AvailabilityZones", "Availability Zones")),
+                # Target info — column names vary by extraction tool. We grab
+                # the most common ones and let the renderer parse instance IDs.
+                "targets": str(_pick(
+                    r, "Targets", "TargetInstanceIds", "BackendInstances",
+                    "Instances", "TargetGroupArns", "TargetGroups",
+                )),
+                "raw_row": r,  # fallback: regex-scan the row for i-* IDs
             })
 
     # --- Internet Gateways ---
@@ -1153,6 +1271,168 @@ def _extract_aws_summary(wb, sheet_names: list) -> dict:
             summary["route_tables"].append({
                 "name": str(_pick(r, "ResourceName", "Name", "RouteTableId")),
                 "vpc": str(_pick(r, "VpcId")),
+            })
+
+    # --- NAT Gateways ---
+    natgw_sheet = _find_sheet_prefer_exact(
+        sheet_names,
+        ["EC2 NAT Gateways", "NAT Gateways", "Nat Gateways"],
+        ["NAT Gateway", "NatGateway"]
+    )
+    if natgw_sheet:
+        natgw_records = _sheet_to_records(wb, natgw_sheet, max_rows=200)
+        summary.setdefault("nat_gateways", [])
+        for r in natgw_records:
+            summary["nat_gateways"].append({
+                "name": str(_pick(r, "ResourceName", "Name", "NatGatewayId")),
+                "vpc": str(_pick(r, "VpcId")),
+                "subnet": str(_pick(r, "SubnetId")),
+                "state": str(_pick(r, "State", "ConnectivityType")),
+                "public_ip": str(_pick(r, "PublicIp")),
+            })
+
+    # --- Auto Scaling Groups ---
+    asg_sheet = _find_sheet_prefer_exact(
+        sheet_names,
+        ["Auto Scaling Groups", "AutoScaling Groups"],
+        ["Auto Scaling Group", "AutoScalingGroup", "AutoScaling"]
+    )
+    if asg_sheet:
+        asg_records = _sheet_to_records(wb, asg_sheet, max_rows=200)
+        summary.setdefault("auto_scaling_groups", [])
+        for r in asg_records:
+            summary["auto_scaling_groups"].append({
+                "name": str(_pick(r, "ResourceName", "Name", "AutoScalingGroupName")),
+                "min_size": str(_pick(r, "MinSize")),
+                "max_size": str(_pick(r, "MaxSize")),
+                "desired": str(_pick(r, "DesiredCapacity")),
+                "launch_template": str(_pick(r, "LaunchTemplate", "LaunchConfigurationName")),
+            })
+
+    # --- Elastic IPs ---
+    eip_sheet = _find_sheet_prefer_exact(
+        sheet_names,
+        ["EC2 Elastic IPs"],
+        ["Elastic IP", "ElasticIP", "EC2 EIP"]
+    )
+    if eip_sheet:
+        eip_records = _sheet_to_records(wb, eip_sheet, max_rows=500)
+        summary.setdefault("elastic_ips", [])
+        for r in eip_records:
+            summary["elastic_ips"].append({
+                "name": str(_pick(r, "ResourceName", "Name", "PublicIp", "AllocationId")),
+                "public_ip": str(_pick(r, "PublicIp")),
+                "attached_to": str(_pick(r, "Attached To", "AttachedTo", "InstanceId", "NetworkInterfaceId")),
+                "attached": str(_pick(r, "Attached")),
+            })
+
+    # --- EBS Volumes ---
+    vol_sheet = _find_sheet_prefer_exact(
+        sheet_names,
+        ["EBS Volumes"],
+        ["EBS Volume", "Volume"]
+    )
+    if vol_sheet:
+        vol_records = _sheet_to_records(wb, vol_sheet, max_rows=2000)
+        summary.setdefault("volumes", [])
+        for r in vol_records:
+            summary["volumes"].append({
+                "name": str(_pick(r, "ResourceName", "Name", "VolumeId")),
+                "size_gb": str(_pick(r, "Size", "SizeGB")),
+                "type": str(_pick(r, "VolumeType")),
+                "az": str(_pick(r, "AvailabilityZone")),
+                "state": str(_pick(r, "State")),
+            })
+
+    # --- ECS Clusters / Services ---
+    ecs_sheet = _find_sheet_prefer_exact(sheet_names, ["ECS Clusters"], ["ECS Cluster"])
+    if ecs_sheet:
+        ecs_records = _sheet_to_records(wb, ecs_sheet, max_rows=200)
+        summary.setdefault("ecs_clusters", [])
+        for r in ecs_records:
+            summary["ecs_clusters"].append({
+                "name": str(_pick(r, "ResourceName", "Name", "clusterName")),
+                "status": str(_pick(r, "Status")),
+                "active_services_count": str(_pick(r, "ActiveServicesCount")),
+            })
+
+    ecs_svc_sheet = _find_sheet_prefer_exact(sheet_names, ["ECS Services"], ["ECS Service"])
+    if ecs_svc_sheet:
+        ecs_svc_records = _sheet_to_records(wb, ecs_svc_sheet, max_rows=300)
+        summary.setdefault("ecs_services", [])
+        for r in ecs_svc_records:
+            summary["ecs_services"].append({
+                "name": str(_pick(r, "ResourceName", "Name", "serviceName")),
+                "cluster": str(_pick(r, "ClusterArn", "Cluster")),
+                "launch_type": str(_pick(r, "LaunchType")),
+            })
+
+    # --- EKS Clusters ---
+    eks_sheet = _find_sheet_prefer_exact(sheet_names, ["EKS Clusters"], ["EKS Cluster"])
+    if eks_sheet:
+        eks_records = _sheet_to_records(wb, eks_sheet, max_rows=100)
+        summary.setdefault("eks_clusters", [])
+        for r in eks_records:
+            summary["eks_clusters"].append({
+                "name": str(_pick(r, "ResourceName", "Name")),
+                "version": str(_pick(r, "Version")),
+                "status": str(_pick(r, "Status")),
+            })
+
+    # --- ECR Repositories ---
+    ecr_sheet = _find_sheet_prefer_exact(sheet_names, ["ECR Repositories"], ["ECR Repository"])
+    if ecr_sheet:
+        ecr_records = _sheet_to_records(wb, ecr_sheet, max_rows=500)
+        summary.setdefault("ecr_repositories", [])
+        for r in ecr_records:
+            summary["ecr_repositories"].append({
+                "name": str(_pick(r, "ResourceName", "Name", "repositoryName")),
+            })
+
+    # --- Lambda Functions ---
+    lambda_sheet = _find_sheet_prefer_exact(sheet_names, ["Lambda Functions"], ["Lambda Function", "Lambda"])
+    if lambda_sheet:
+        lambda_records = _sheet_to_records(wb, lambda_sheet, max_rows=500)
+        summary.setdefault("lambda_functions", [])
+        for r in lambda_records:
+            summary["lambda_functions"].append({
+                "name": str(_pick(r, "ResourceName", "Name", "FunctionName")),
+                "runtime": str(_pick(r, "Runtime")),
+            })
+
+    # --- RDS DB Clusters (Aurora/DocDB/Neptune) ---
+    rds_cluster_sheet = _find_sheet_prefer_exact(
+        sheet_names, ["RDS Clusters", "RDS clusters"], ["RDS Cluster", "DBCluster"]
+    )
+    if rds_cluster_sheet:
+        rdsc_records = _sheet_to_records(wb, rds_cluster_sheet, max_rows=200)
+        summary.setdefault("rds_clusters", [])
+        for r in rdsc_records:
+            summary["rds_clusters"].append({
+                "name": str(_pick(r, "ResourceName", "Name", "DBClusterIdentifier")),
+                "engine": str(_pick(r, "Engine")),
+                "status": str(_pick(r, "Status")),
+            })
+
+    # --- DynamoDB Tables ---
+    ddb_sheet = _find_sheet_prefer_exact(sheet_names, ["DynamoDB Tables"], ["DynamoDB", "DDB"])
+    if ddb_sheet:
+        ddb_records = _sheet_to_records(wb, ddb_sheet, max_rows=500)
+        summary.setdefault("dynamodb_tables", [])
+        for r in ddb_records:
+            summary["dynamodb_tables"].append({
+                "name": str(_pick(r, "ResourceName", "Name", "TableName")),
+            })
+
+    # --- Classic Load Balancers (ELB v1) ---
+    clb_sheet = _find_sheet_prefer_exact(sheet_names, ["Classic Load Balancers"], ["Classic Load Balancer"])
+    if clb_sheet:
+        clb_records = _sheet_to_records(wb, clb_sheet, max_rows=200)
+        for r in clb_records:
+            summary["load_balancers"].append({
+                "name": str(_pick(r, "ResourceName", "Name", "LoadBalancerName")),
+                "type": "Classic",
+                "scheme": str(_pick(r, "Scheme")),
             })
 
     return summary
@@ -1545,25 +1825,6 @@ def _parse_peering_targets(peerings_value) -> List[str]:
         token = p.strip().strip("'\"")
         if token and len(token) > 1:
             cleaned.append(token)
-    return list(dict.fromkeys(cleaned))
-
-
-def _extract_names_from_id_list(raw_value) -> List[str]:
-    """Extract resource names from serialized ARM IDs or mixed list payloads."""
-    if not _is_present(raw_value):
-        return []
-    text = str(raw_value)
-    # Prefer explicit NIC extraction to avoid capturing unrelated path segments.
-    names = re.findall(r"networkInterfaces/([A-Za-z0-9._-]+)", text, flags=re.IGNORECASE)
-    if names:
-        return list(dict.fromkeys([n.lower() for n in names if n]))
-
-    # Fallback: generic ARM-like segment capture.
-    names = re.findall(r"/([A-Za-z0-9._-]+)", text)
-    if names:
-        return list(dict.fromkeys([n.lower() for n in names if n]))
-    parts = re.split(r"[,\n;|]+", text)
-    cleaned = [p.strip().strip("'\"").lower() for p in parts if p and p.strip()]
     return list(dict.fromkeys(cleaned))
 
 
@@ -2276,12 +2537,434 @@ def _build_azure_network_diagram(summary: Dict) -> str:
     return _clean_mermaid_output("\n".join(lines))
 
 
+# ---------------------------------------------------------------------------
+# AWS draw.io renderer
+# ---------------------------------------------------------------------------
+# Uses drawio's built-in AWS4 stencil library (no external files needed).
+# AWS resource icons are referenced via `shape=mxgraph.aws4.resourceIcon;
+# resIcon=mxgraph.aws4.<resource>`. Container boxes (VPCs, Subnets) use
+# `shape=mxgraph.aws4.group` so they render with AWS's official dashed
+# borders and labels.
+
+# AWS service category colors (matches official AWS Architecture Center).
+_AWS_COLOR_COMPUTE = "#ED7100"   # orange
+_AWS_COLOR_NETWORK = "#8C4FFF"   # purple
+_AWS_COLOR_STORAGE = "#7AA116"   # green
+_AWS_COLOR_DB = "#C925D1"        # magenta
+_AWS_COLOR_SECURITY = "#DD344C"  # red
+_AWS_COLOR_INTEGRATION = "#E7157B"
+
+
+def _aws_icon_style(res_icon: str, color: str) -> str:
+    return (
+        f"sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=none;"
+        f"fillColor={color};strokeColor=#232F3E;dashed=0;verticalLabelPosition=bottom;"
+        f"verticalAlign=top;align=center;html=1;fontSize=10;fontStyle=0;aspect=fixed;"
+        f"shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.{res_icon};"
+    )
+
+
+def _build_aws_drawio_network_xml(summary: Dict) -> str:
+    """AWS network topology in drawio XML — VPC → Subnet → EC2 layout."""
+    networks = summary.get("networks", []) or []
+    subnets = summary.get("subnets", []) or []
+    compute = summary.get("compute", []) or []
+    storage = summary.get("storage", []) or []
+    databases = summary.get("databases", []) or []
+    internet_gateways = summary.get("internet_gateways", []) or []
+    vpc_endpoints = summary.get("vpc_endpoints", []) or []
+    load_balancers = summary.get("load_balancers", []) or []
+    nat_gateways = summary.get("nat_gateways", []) or []
+    auto_scaling_groups = summary.get("auto_scaling_groups", []) or []
+    elastic_ips = summary.get("elastic_ips", []) or []
+    volumes = summary.get("volumes", []) or []
+    ecs_clusters = summary.get("ecs_clusters", []) or []
+    ecs_services = summary.get("ecs_services", []) or []
+    eks_clusters = summary.get("eks_clusters", []) or []
+    ecr_repos = summary.get("ecr_repositories", []) or []
+    lambda_functions = summary.get("lambda_functions", []) or []
+    rds_clusters = summary.get("rds_clusters", []) or []
+    dynamodb_tables = summary.get("dynamodb_tables", []) or []
+
+    # --- mxfile skeleton -----------------------------------------------------
+    mxfile = ET.Element("mxfile", {"host": "app.diagrams.net", "type": "device"})
+    diagram = ET.SubElement(mxfile, "diagram", {"id": "aws-network", "name": "AWS Network"})
+    model = ET.SubElement(diagram, "mxGraphModel", {
+        "dx": "1600", "dy": "900", "grid": "1", "gridSize": "10",
+        "guides": "1", "tooltips": "1", "connect": "1", "arrows": "1",
+        "fold": "1", "page": "1", "pageScale": "1",
+        "pageWidth": "2400", "pageHeight": "1600", "math": "0", "shadow": "0",
+    })
+    root = ET.SubElement(model, "root")
+    ET.SubElement(root, "mxCell", {"id": "0"})
+    ET.SubElement(root, "mxCell", {"id": "1", "parent": "0"})
+
+    cell_seq = [1]  # mutable counter
+
+    def add_vertex(value, x, y, w, h, style, parent="1"):
+        cell_seq[0] += 1
+        nid = f"n{cell_seq[0]}"
+        c = ET.SubElement(root, "mxCell", {
+            "id": nid, "value": str(value or ""),
+            "style": style, "vertex": "1", "parent": parent,
+        })
+        ET.SubElement(c, "mxGeometry", {
+            "x": str(int(x)), "y": str(int(y)),
+            "width": str(int(w)), "height": str(int(h)), "as": "geometry",
+        })
+        return nid
+
+    def add_edge(src, tgt, style="endArrow=block;strokeColor=#5d6d7e;"):
+        cell_seq[0] += 1
+        nid = f"e{cell_seq[0]}"
+        c = ET.SubElement(root, "mxCell", {
+            "id": nid, "style": style, "edge": "1",
+            "parent": "1", "source": src, "target": tgt,
+        })
+        ET.SubElement(c, "mxGeometry", {"relative": "1", "as": "geometry"})
+        return nid
+
+    # --- Styles --------------------------------------------------------------
+    style_vpc_container = (
+        "rounded=0;whiteSpace=wrap;html=1;dashed=1;dashPattern=1 4;"
+        "strokeColor=#248814;fillColor=#E9F3E6;strokeWidth=2;verticalAlign=top;"
+        "fontSize=14;fontStyle=1;fontColor=#248814;align=left;spacingLeft=12;"
+    )
+    style_subnet_public = (
+        "rounded=0;whiteSpace=wrap;html=1;dashed=0;"
+        "strokeColor=#7AA116;fillColor=#F2F8E8;strokeWidth=1;verticalAlign=top;"
+        "fontSize=12;fontStyle=1;fontColor=#3F6F00;align=left;spacingLeft=8;"
+    )
+    style_subnet_private = (
+        "rounded=0;whiteSpace=wrap;html=1;dashed=0;"
+        "strokeColor=#147EBA;fillColor=#E6F2F8;strokeWidth=1;verticalAlign=top;"
+        "fontSize=12;fontStyle=1;fontColor=#0E5A86;align=left;spacingLeft=8;"
+    )
+    style_outer = (
+        "rounded=0;whiteSpace=wrap;html=1;strokeColor=#7f8c8d;"
+        "fillColor=#f8f9fa;strokeWidth=1;verticalAlign=top;fontSize=12;fontStyle=1;"
+        "align=left;spacingLeft=8;"
+    )
+    style_panel = (
+        "rounded=0;whiteSpace=wrap;html=1;strokeColor=#95a5a6;"
+        "fillColor=#ffffff;strokeWidth=1;verticalAlign=top;fontSize=12;fontStyle=1;"
+        "align=left;spacingLeft=8;"
+    )
+
+    # --- Index data ----------------------------------------------------------
+    # VPC id ↔ name resolution.
+    vpc_id_to_name: Dict[str, str] = {}
+    for v in networks:
+        name = str(v.get("name") or "").strip()
+        vid = str(v.get("vpc_id") or "").strip()
+        if vid:
+            vpc_id_to_name[vid.lower()] = name or vid
+        if name:
+            vpc_id_to_name[name.lower()] = name
+
+    def _resolve_vpc(raw):
+        s = str(raw or "").strip().lower()
+        return vpc_id_to_name.get(s, raw or "")
+
+    # Subnet id → record (for label/cidr lookup when EC2 references by ID).
+    subnet_id_to_record: Dict[str, dict] = {}
+    for sn in subnets:
+        sid = str(sn.get("subnet_id") or "").strip().lower()
+        if sid:
+            subnet_id_to_record[sid] = sn
+
+    # Group compute by (VPC, subnet-key).
+    # subnet-key is the subnet ID when available, else the subnet name field.
+    vpc_subnet_to_compute: Dict[tuple, List[dict]] = defaultdict(list)
+    for c in compute:
+        vpc = _resolve_vpc(c.get("vpc"))
+        snet = str(c.get("subnet") or "").strip()
+        if not vpc:
+            vpc = "Unassigned"
+        if not snet:
+            snet = "default"
+        vpc_subnet_to_compute[(vpc, snet)].append(c)
+
+    # All subnet keys per VPC.
+    vpc_to_subnet_keys: Dict[str, List[str]] = defaultdict(list)
+    for (vpc, snet) in vpc_subnet_to_compute.keys():
+        if snet not in vpc_to_subnet_keys[vpc]:
+            vpc_to_subnet_keys[vpc].append(snet)
+    # Also include subnets that have no compute (so they still render).
+    for sn in subnets:
+        vpc = _resolve_vpc(sn.get("vpc"))
+        sid = str(sn.get("subnet_id") or "").strip()
+        sname = str(sn.get("name") or "").strip()
+        key = sid or sname or "default"
+        if vpc and key not in vpc_to_subnet_keys[vpc]:
+            vpc_to_subnet_keys[vpc].append(key)
+
+    # Ordered list of VPCs to render (deterministic).
+    vpc_names_to_render = [str(v.get("name") or "").strip() for v in networks if v.get("name")]
+    # Add any VPCs found in compute but not in networks list.
+    for (vpc, _snet) in vpc_subnet_to_compute.keys():
+        if vpc and vpc not in vpc_names_to_render and vpc != "Unassigned":
+            vpc_names_to_render.append(vpc)
+    if "Unassigned" in (v for (v, _) in vpc_subnet_to_compute.keys()):
+        vpc_names_to_render.append("Unassigned")
+
+    # --- Layout constants ----------------------------------------------------
+    env_x, env_y = 60, 60
+    ingress_y = env_y + 30
+    vpc_w_each = 760
+    vpc_gap_x = 40
+    vpc_top_y = env_y + 200
+
+    # Per-subnet capacity / cell sizing.
+    vm_max_per_subnet = 6  # AWS often has more EC2 per subnet; allow more than Azure (4)
+    cell_w = 130
+    cell_h = 76
+    cell_gap = 16
+    grid_cols = 3  # 3-column grid → fits 6 cells in 2 rows nicely
+
+    # --- Ingress (User → Internet → Route 53) --------------------------------
+    user_id = add_vertex("User", env_x + 20, ingress_y, 48, 48,
+                         _aws_icon_style("users", _AWS_COLOR_SECURITY))
+    inet_id = add_vertex("Internet", env_x + 110, ingress_y, 48, 48,
+                         _aws_icon_style("internet_gateway", _AWS_COLOR_NETWORK))
+    r53_id = add_vertex("Route 53", env_x + 210, ingress_y, 48, 48,
+                        _aws_icon_style("route_53", _AWS_COLOR_NETWORK))
+    add_edge(user_id, inet_id)
+    add_edge(inet_id, r53_id)
+
+    # Map EC2 instance-id → its drawio node id so the LB pass can draw
+    # connectivity arrows. EC2 instance IDs live in the `connectivity` text
+    # of each compute record (e.g., "Attached to: i-011a1a99958420bae | ...").
+    instance_id_to_node: Dict[str, str] = {}
+    _iid_re = re.compile(r"\bi-[0-9a-f]{8,}\b", re.IGNORECASE)
+
+    # --- Render each VPC -----------------------------------------------------
+    rendered_vpc_ids: List[str] = []  # for ingress arrow to first VPC
+    vpc_box_max_right = env_x
+    vpc_box_max_bottom = vpc_top_y
+
+    for vi, vpc_name in enumerate(vpc_names_to_render):
+        vpc_x = env_x + 20 + vi * (vpc_w_each + vpc_gap_x)
+
+        subnet_keys = vpc_to_subnet_keys.get(vpc_name, [])
+        if not subnet_keys:
+            continue
+
+        # Compute VPC height: each subnet box height = header + cells.
+        per_subnet_heights = []
+        for sk in subnet_keys:
+            cnt = len(vpc_subnet_to_compute.get((vpc_name, sk), []))
+            shown = min(cnt, vm_max_per_subnet)
+            rows = max(1, (shown + grid_cols - 1) // grid_cols)
+            h = 60 + rows * (cell_h + cell_gap)
+            per_subnet_heights.append(h)
+
+        vpc_h = 60 + sum(per_subnet_heights) + 30 * len(subnet_keys)
+        vpc_id = add_vertex(f"VPC: {vpc_name}", vpc_x, vpc_top_y, vpc_w_each, vpc_h,
+                            style_vpc_container)
+        rendered_vpc_ids.append(vpc_id)
+        vpc_box_max_right = max(vpc_box_max_right, vpc_x + vpc_w_each)
+        vpc_box_max_bottom = max(vpc_box_max_bottom, vpc_top_y + vpc_h)
+
+        # Subnets stacked vertically inside the VPC.
+        subnet_y_cursor = vpc_top_y + 40
+        for si, sk in enumerate(subnet_keys):
+            # Resolve subnet display: prefer name + CIDR if we have it.
+            sn_rec = subnet_id_to_record.get(sk.lower())
+            if sn_rec:
+                sn_label = sn_rec.get("name") or sk
+                cidr = sn_rec.get("cidr") or ""
+                az = sn_rec.get("az") or ""
+            else:
+                sn_label = sk
+                cidr = ""
+                az = ""
+            # Naive public/private guess from name.
+            is_public = "public" in str(sn_label).lower() or "pub" in str(sn_label).lower()
+            sn_style = style_subnet_public if is_public else style_subnet_private
+            sn_h = per_subnet_heights[si]
+
+            badge = f"{sn_label}"
+            if cidr:
+                badge += f"  ·  {cidr}"
+            if az:
+                badge += f"  ·  {az}"
+
+            subnet_x = vpc_x + 20
+            subnet_w = vpc_w_each - 40
+            sn_box_id = add_vertex(badge, subnet_x, subnet_y_cursor, subnet_w, sn_h, sn_style)
+
+            # Render EC2 grid inside subnet.
+            ec2_items = vpc_subnet_to_compute.get((vpc_name, sk), [])
+            # Prioritize ASG-tagged items (mirrors VMSS handling on Azure side).
+            asg_items = [c for c in ec2_items if c.get("is_asg") or c.get("is_vmss")]
+            other_items = [c for c in ec2_items if c not in asg_items]
+            remaining = max(0, vm_max_per_subnet - len(asg_items))
+            show_items = asg_items + other_items[:remaining]
+            overflow = len(ec2_items) - len(show_items)
+
+            grid_x0 = subnet_x + 20
+            grid_y0 = subnet_y_cursor + 36
+            for idx, ec2 in enumerate(show_items):
+                row = idx // grid_cols
+                col = idx % grid_cols
+                cx = grid_x0 + col * (cell_w + cell_gap)
+                cy = grid_y0 + row * (cell_h + cell_gap)
+                ec2_name = str(ec2.get("name") or f"ec2-{idx+1}")
+                is_asg = ec2.get("is_asg") or ec2.get("is_vmss")
+                icon = "auto_scaling2" if is_asg else "ec2"
+                ec2_node_id = add_vertex(ec2_name[:24], cx, cy, 50, 56,
+                                         _aws_icon_style(icon, _AWS_COLOR_COMPUTE))
+                # Index by every instance-id found in the connectivity blob
+                # so the LB pass can target this node by ID.
+                conn_text = str(ec2.get("connectivity") or "")
+                for iid in _iid_re.findall(conn_text):
+                    instance_id_to_node[iid.lower()] = ec2_node_id
+
+            if overflow > 0:
+                # Small badge bottom-right showing how many were hidden.
+                add_vertex(f"+{overflow} more", subnet_x + subnet_w - 100,
+                           subnet_y_cursor + sn_h - 26, 90, 18,
+                           "rounded=1;whiteSpace=wrap;html=1;strokeColor=#95a5a6;"
+                           "fillColor=#ecf0f1;fontSize=10;align=center;")
+
+            subnet_y_cursor += sn_h + 16
+
+    # --- Side panels ---------------------------------------------------------
+    panel_x = vpc_box_max_right + 40
+    panel_y = vpc_top_y
+
+    def _render_panel(title, items, icon_name, color, max_items=20):
+        nonlocal panel_y
+        if not items:
+            return
+        panel_w = 240
+        rows = min(len(items), max_items)
+        cell_per_row = 2
+        n_rows = (rows + cell_per_row - 1) // cell_per_row
+        panel_h = 60 + n_rows * 74
+        pid = add_vertex(f"{title} ({len(items)})", panel_x, panel_y, panel_w, panel_h,
+                         style_panel)
+        for idx, it in enumerate(items[:max_items]):
+            r = idx // cell_per_row
+            c = idx % cell_per_row
+            x = panel_x + 30 + c * 100
+            y = panel_y + 40 + r * 74
+            label = str(it.get("name") or "")[:18]
+            add_vertex(label, x, y, 50, 56, _aws_icon_style(icon_name, color))
+        panel_y += panel_h + 30
+
+    # ---- Load Balancers: place inside their VPC + draw arrows to targets ----
+    # LBs are part of the network topology; we render them inside the VPC box
+    # (top edge) and connect them to EC2 targets when instance IDs are listed
+    # in any of the LB row's columns or fallback raw_row.
+    def _lb_target_instance_ids(lb: dict) -> List[str]:
+        ids: List[str] = []
+        ids.extend(_iid_re.findall(str(lb.get("targets") or "")))
+        raw = lb.get("raw_row") or {}
+        if isinstance(raw, dict):
+            joined = " ".join(str(x) for x in raw.values() if x is not None)
+            ids.extend(_iid_re.findall(joined))
+        seen, out = set(), []
+        for i in ids:
+            il = i.lower()
+            if il not in seen:
+                seen.add(il)
+                out.append(il)
+        return out
+
+    # Track LB y-offset per VPC so multiple LBs stack neatly.
+    vpc_to_lb_count: Dict[str, int] = defaultdict(int)
+    # Get rendered VPC box positions: scan for vertex cells whose value starts
+    # with "VPC: ". The geometry x/y/width gives us the placement.
+    vpc_box_geom: Dict[str, dict] = {}
+    for cell in root.findall("mxCell"):
+        v = cell.get("value") or ""
+        if v.startswith("VPC: "):
+            vname = v[len("VPC: "):].strip()
+            geom = cell.find("mxGeometry")
+            if geom is not None:
+                vpc_box_geom[vname] = {
+                    "id": cell.get("id"),
+                    "x": int(geom.get("x", "0")),
+                    "y": int(geom.get("y", "0")),
+                    "w": int(geom.get("width", "0")),
+                    "h": int(geom.get("height", "0")),
+                }
+
+    lb_unplaced: List[dict] = []
+    for lb in load_balancers:
+        lb_vpc = _resolve_vpc(lb.get("vpc"))
+        if not lb_vpc:
+            lb_unplaced.append(lb)
+            continue
+        geom = vpc_box_geom.get(lb_vpc)
+        if not geom:
+            lb_unplaced.append(lb)
+            continue
+        # Place LB icon just inside the VPC box, top-right corner, stacking
+        # horizontally then wrapping if there are many.
+        slot = vpc_to_lb_count[lb_vpc]
+        vpc_to_lb_count[lb_vpc] += 1
+        lb_x = geom["x"] + geom["w"] - 70 - (slot * 70)
+        lb_y = geom["y"] + 8
+        lb_label = str(lb.get("name") or "lb")[:20]
+        scheme = str(lb.get("scheme") or "").strip()
+        if scheme:
+            lb_label = f"{lb_label} ({scheme})"
+        lb_node = add_vertex(lb_label, lb_x, lb_y, 50, 56,
+                             _aws_icon_style("elastic_load_balancing", _AWS_COLOR_NETWORK))
+        # Draw arrows to target instances when we can resolve them.
+        for tgt_id in _lb_target_instance_ids(lb):
+            tgt_node = instance_id_to_node.get(tgt_id)
+            if tgt_node:
+                add_edge(lb_node, tgt_node,
+                         style="endArrow=block;endFill=1;strokeColor=#8C4FFF;"
+                               "strokeWidth=1;dashed=0;")
+
+    # ---- Side panels for topology-relevant resources only ----
+    # (EIPs, EBS Volumes, ECR Repos removed — they're inventory, not topology.)
+
+    # Compute / scaling
+    _render_panel("Auto Scaling Groups", auto_scaling_groups, "auto_scaling2", _AWS_COLOR_COMPUTE)
+    _render_panel("Lambda Functions", lambda_functions, "lambda", _AWS_COLOR_COMPUTE)
+    _render_panel("ECS Clusters", ecs_clusters, "elastic_container_service", _AWS_COLOR_COMPUTE)
+    _render_panel("ECS Services", ecs_services, "elastic_container_service", _AWS_COLOR_COMPUTE, max_items=12)
+    _render_panel("EKS Clusters", eks_clusters, "elastic_kubernetes_service", _AWS_COLOR_COMPUTE)
+
+    # Network — only LBs without a resolvable VPC fall back to a side panel
+    if lb_unplaced:
+        _render_panel("Load Balancers (no VPC)", lb_unplaced, "elastic_load_balancing", _AWS_COLOR_NETWORK)
+    _render_panel("Internet Gateways", internet_gateways, "internet_gateway", _AWS_COLOR_NETWORK)
+    _render_panel("NAT Gateways", nat_gateways, "nat_gateway", _AWS_COLOR_NETWORK)
+    _render_panel("VPC Endpoints", vpc_endpoints, "endpoints", _AWS_COLOR_NETWORK)
+
+    # Storage — S3 is the only one with topology meaning (VPC endpoints connect
+    # to it). EBS volumes are per-EC2 disks; not a network entity.
+    _render_panel("S3 Buckets", storage, "simple_storage_service", _AWS_COLOR_STORAGE)
+
+    # Database
+    _render_panel("RDS Instances", databases, "rds", _AWS_COLOR_DB)
+    _render_panel("RDS Clusters", rds_clusters, "rds", _AWS_COLOR_DB)
+    _render_panel("DynamoDB Tables", dynamodb_tables, "dynamodb", _AWS_COLOR_DB)
+
+    # Connect ingress to the first VPC.
+    if rendered_vpc_ids:
+        add_edge(r53_id, rendered_vpc_ids[0],
+                 style="endArrow=block;endFill=1;strokeColor=#5d6d7e;strokeWidth=1;")
+
+    return ET.tostring(mxfile, encoding="unicode")
+
+
 def _build_drawio_network_xml(summary: Dict) -> str:
     """
-    Build native draw.io XML for a clean Azure-like network architecture layout.
-    Designed to stay readable in one canvas and to mimic enterprise box-in-box topology.
+    Build native draw.io XML for a clean network architecture layout.
+    Dispatches by cloud — Azure uses Azure-Icons SVGs, AWS uses drawio's
+    built-in AWS4 stencil library (no external files needed).
     """
     cloud = str(summary.get("cloud") or "").lower()
+    if cloud == "aws":
+        return _build_aws_drawio_network_xml(summary)
     if cloud != "azure":
         return ""
 
@@ -2784,31 +3467,35 @@ def _build_drawio_network_xml(summary: Dict) -> str:
         "fontSize=10;strokeColor=none;fillColor=none;"
     )
 
-    # Azure icon URLs (official assets mirrored by azureicons.com).
-    icon_vm = "https://www.azureicons.com/static/images/icons/Compute/svg/Virtual-Machine.svg"
-    icon_vnet = "https://www.azureicons.com/static/images/icons/Networking/svg/Virtual-Networks.svg"
-    icon_subnet = "https://www.azureicons.com/static/images/icons/Networking/svg/Subnet.svg"
-    icon_storage = "https://www.azureicons.com/static/images/icons/Storage/svg/Storage-Accounts.svg"
-    icon_database = "https://www.azureicons.com/static/images/icons/Databases/svg/Azure-SQL.svg"
-    # Additional DB/SQL icons
-    icon_sql_vm = "https://www.azureicons.com/static/images/icons/Databases/svg/Azure-SQL-VM.svg"
-    icon_mysql = "https://www.azureicons.com/static/images/icons/Databases/svg/Azure-Database-MySQL-Server.svg"
-    icon_postgres = "https://www.azureicons.com/static/images/icons/Databases/svg/Azure-Database-PostgreSQL-Server.svg"
-    icon_cosmos = "https://www.azureicons.com/static/images/icons/Databases/svg/Azure-Cosmos-DB.svg"
-    icon_dns = "https://www.azureicons.com/static/images/icons/Networking/svg/DNS-Zones.svg"
-    icon_nsg = "https://www.azureicons.com/static/images/icons/Networking/svg/Network-Security-Groups.svg"
-    icon_aks = "https://www.azureicons.com/static/images/icons/Containers/svg/Kubernetes-Services.svg"
-    icon_lb = "https://www.azureicons.com/static/images/icons/Networking/svg/Load-Balancers.svg"
-    icon_appgw = "https://www.azureicons.com/static/images/icons/Networking/svg/Application-Gateways.svg"
-    icon_pe = "https://www.azureicons.com/static/images/icons/Networking/svg/Private-Link.svg"
-    icon_private_link = "https://www.azureicons.com/static/images/icons/Networking/svg/Private-Link-Service.svg"
-    # VM Scale Set icon (fallback to VM icon host path)
-    icon_vmss = "https://www.azureicons.com/static/images/icons/Compute/svg/VM-Scale-Sets.svg"
-    # Use a guaranteed-visible icon for peering marker.
-    # Use a stable icon source so peering marker always renders.
-    icon_peering = "https://raw.githubusercontent.com/twitter/twemoji/master/assets/svg/1f517.svg"
-    icon_user = "https://raw.githubusercontent.com/twitter/twemoji/master/assets/svg/1f464.svg"
-    icon_internet = "https://raw.githubusercontent.com/twitter/twemoji/master/assets/svg/1f310.svg"
+    # Icons are resolved from the local Azure-Icons/ folder and embedded as
+    # base64 data URIs by get_icon_uri(). The remote URL is kept as a
+    # documented fallback that only kicks in if the local file is missing.
+    AZ = "https://www.azureicons.com/static/images/icons"
+    TW = "https://raw.githubusercontent.com/twitter/twemoji/master/assets/svg"
+
+    icon_vm = get_icon_uri("Compute", "Virtual-Machine", f"{AZ}/Compute/svg/Virtual-Machine.svg")
+    icon_vnet = get_icon_uri("Networking", "Virtual-Networks", f"{AZ}/Networking/svg/Virtual-Networks.svg")
+    icon_subnet = get_icon_uri("Networking", "Subnet", f"{AZ}/Networking/svg/Subnet.svg")
+    icon_storage = get_icon_uri("Storage", "Storage-Accounts", f"{AZ}/Storage/svg/Storage-Accounts.svg")
+    icon_database = get_icon_uri("Databases", "Azure-SQL", f"{AZ}/Databases/svg/Azure-SQL.svg")
+    icon_sql_vm = get_icon_uri("Databases", "Azure-SQL-VM", f"{AZ}/Databases/svg/Azure-SQL-VM.svg")
+    icon_mysql = get_icon_uri("Databases", "Azure-Database-MySQL-Server", f"{AZ}/Databases/svg/Azure-Database-MySQL-Server.svg")
+    icon_postgres = get_icon_uri("Databases", "Azure-Database-PostgreSQL-Server", f"{AZ}/Databases/svg/Azure-Database-PostgreSQL-Server.svg")
+    icon_cosmos = get_icon_uri("Databases", "Azure-Cosmos-DB", f"{AZ}/Databases/svg/Azure-Cosmos-DB.svg")
+    icon_dns = get_icon_uri("Networking", "DNS-Zones", f"{AZ}/Networking/svg/DNS-Zones.svg")
+    icon_nsg = get_icon_uri("Networking", "Network-Security-Groups", f"{AZ}/Networking/svg/Network-Security-Groups.svg")
+    # AKS lives under Compute/ locally (override map handles the lookup).
+    icon_aks = get_icon_uri("Containers", "Kubernetes-Services", f"{AZ}/Containers/svg/Kubernetes-Services.svg")
+    icon_lb = get_icon_uri("Networking", "Load-Balancers", f"{AZ}/Networking/svg/Load-Balancers.svg")
+    icon_appgw = get_icon_uri("Networking", "Application-Gateways", f"{AZ}/Networking/svg/Application-Gateways.svg")
+    icon_pe = get_icon_uri("Networking", "Private-Link", f"{AZ}/Networking/svg/Private-Link.svg")
+    icon_private_link = get_icon_uri("Networking", "Private-Link-Service", f"{AZ}/Networking/svg/Private-Link-Service.svg")
+    icon_vmss = get_icon_uri("Compute", "VM-Scale-Sets", f"{AZ}/Compute/svg/VM-Scale-Sets.svg")
+    # Previously Twemoji glyphs — now resolved to Azure-native icons via the
+    # override map (Identity/Users, Networking/Public-IP-Addresses, Other/Peerings).
+    icon_peering = get_icon_uri("Twemoji", "Peering", f"{TW}/1f517.svg")
+    icon_user = get_icon_uri("Twemoji", "User", f"{TW}/1f464.svg")
+    icon_internet = get_icon_uri("Twemoji", "Internet", f"{TW}/1f310.svg")
 
     def short_name(value: str, limit: int = 16) -> str:
         # Keep full resource names exactly as discovered (no truncation).
@@ -2912,7 +3599,16 @@ def _build_drawio_network_xml(summary: Dict) -> str:
                 })
 
                 subnet_vms = subnet_to_vms.get(sname.lower(), [])
-                show_vms = subnet_vms[:vm_max_per_subnet]
+                # Prioritize VMSS in the render order: each VMSS represents an
+                # entire scale set (one logical entity), so it MUST appear inside
+                # its subnet even when the subnet has many individual VMs above
+                # the per-subnet cap. Without this, VMSS were getting pushed past
+                # slot 4 and silently dropped — making them look like they
+                # rendered "outside" the subnet box.
+                vmss_items = [v for v in subnet_vms if v.get("is_vmss")]
+                vm_items = [v for v in subnet_vms if not v.get("is_vmss")]
+                remaining_slots = max(0, vm_max_per_subnet - len(vmss_items))
+                show_vms = vmss_items + vm_items[:remaining_slots]
                 # Centered 2x2 VM grid with explicit text labels under each icon.
                 cell_w = 160
                 cell_h = 68
@@ -3400,12 +4096,16 @@ def _build_drawio_network_xml(summary: Dict) -> str:
     for edge in pending_aks_lb_edges:
         add_edge(edge["lb"], edge["aks"], style="endArrow=block;endFill=1;strokeWidth=1;strokeColor=#5d6d7e;")
 
-    # Draw a fallback VMSS panel only for VM Scale Sets that were NOT placed into any VNet/subnet
+    # Draw a fallback VMSS panel only for VM Scale Sets that were NOT placed into any VNet/subnet.
+    # IMPORTANT: previous positioning was `storage_x + storage_w + 30` which placed the panel
+    # OUTSIDE the environment box (env_w only extends to storage_x + storage_w + 40, but the
+    # panel itself is 260 wide → ~250px hanging off the right edge). We now stack the panel
+    # BELOW the storage box, aligned with it, so it stays inside the visible diagram area.
     unplaced_vmss = [v for v in vm_scale_sets if not str(v.get("vnet") or "").strip()]
     if unplaced_vmss:
-        panel_x = storage_x + storage_w + 30
-        panel_y = storage_y
-        panel_w = 260
+        panel_x = storage_x
+        panel_w = storage_w
+        panel_y = storage_y + storage_h + 20
         panel_h = max(120, min(600, 28 + len(unplaced_vmss) * 28))
         panel_id = add_vertex(f"VM Scale Sets ({len(unplaced_vmss)})", panel_x, panel_y, panel_w, panel_h, style_outer)
         # Add simple icon entries vertically for only the unplaced VMSS

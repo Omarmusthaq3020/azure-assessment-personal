@@ -28,6 +28,11 @@ COPY providers_raw.json .
 COPY iam_roles_extractor.py .
 COPY vm_spot_extractor.py .
 
+# Local Azure icon assets — referenced by backend/architecture_generator.py
+# (get_icon_uri) so diagrams embed icons as base64 data URIs instead of
+# fetching them at render time from azureicons.com.
+COPY Azure-Icons/ ./Azure-Icons/
+
 # Copy Built Frontend from Stage 1
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 

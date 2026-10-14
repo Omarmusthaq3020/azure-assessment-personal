@@ -49,7 +49,7 @@ class AzureOpenAIConfig:
     # Azure OpenAI Endpoint
     ENDPOINT = os.getenv(
         "AZURE_OPENAI_ENDPOINT",
-        "https://azure-migration-open-ai.openai.azure.com/"
+        "https://openai087654.openai.azure.com/"
     )
     
     # Azure OpenAI API Key — set via AZURE_OPENAI_API_KEY env var, never hardcode
@@ -60,11 +60,11 @@ class AzureOpenAIConfig:
     # Deployment Name
     DEPLOYMENT_NAME = os.getenv(
         "AZURE_OPENAI_DEPLOYMENT_NAME",
-        "gpt-4.1"
+        "gpt-5.4-mini"
     )
     
     # API Version
-    API_VERSION = "2024-10-21"
+    API_VERSION = "2024-12-01-preview"
     
     # Retry Configuration
     MAX_RETRIES = 5

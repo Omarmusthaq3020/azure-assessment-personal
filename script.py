@@ -168,14 +168,15 @@ def clean_columns(df):
 
     return df
 
-def query_azure_resource_graph(env=None, subscription_ids=None):
-    if subscription_ids:
-        print(f"🔍 Querying Azure Resource Graph for {len(subscription_ids)} selected subscription(s)...")
-    else:
-        print("🔍 Querying Azure Resource Graph (fetching all resources)...")
-    all_resources = []
+def _arg_query_single_scope(env=None, subscription_ids=None):
+    """Run the paginated ARG query for one scope (a subscription subset, or all).
+
+    Raises subprocess.CalledProcessError if the `az graph query` call fails so
+    the caller can decide whether to skip just this scope or fail outright.
+    """
+    scope_resources = []
     skip_token = None
-    
+
     while True:
         cmd = [
             'az', 'graph', 'query',
@@ -187,37 +188,62 @@ def query_azure_resource_graph(env=None, subscription_ids=None):
         # Scope query to selected subscriptions for faster execution and smaller payloads.
         if subscription_ids:
             cmd.extend(['--subscriptions'] + list(subscription_ids))
-        
+
         # If we have a token from the previous run, use it to get the next batch
         if skip_token:
             cmd.extend(['--skip-token', skip_token])
-            
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+            env=env
+        )
+
+        response = json.loads(result.stdout)
+        scope_resources.extend(response.get('data', []))
+
+        # Check if Azure gave us a token for the next page
+        skip_token = response.get('skip_token')
+        if not skip_token:
+            break  # No more data, stop looping
+
+        print(f"   ...fetched {len(scope_resources)} resources so far...")
+
+    return scope_resources
+
+
+def query_azure_resource_graph(env=None, subscription_ids=None):
+    all_resources = []
+
+    if subscription_ids and len(subscription_ids) > 1:
+        # Combined mode: query each subscription INDEPENDENTLY so that one
+        # empty or inaccessible subscription cannot wipe out the results for
+        # all the others. A single `az graph query --subscriptions A B C`
+        # fails as a whole if any one of A/B/C is invalid or unreadable, which
+        # is why the combined workbook previously came back empty.
+        print(f"🔍 Querying Azure Resource Graph for {len(subscription_ids)} selected subscription(s) (per-subscription)...")
+        for sid in subscription_ids:
+            try:
+                subset = _arg_query_single_scope(env=env, subscription_ids=[sid])
+                print(f"   ✅ {sid}: {len(subset)} resources")
+                all_resources.extend(subset)
+            except subprocess.CalledProcessError as e:
+                print(f"   ⚠️ Skipping subscription {sid} — ARG query failed (no access, invalid, or wrong tenant): {e.stderr}")
+                continue
+    else:
+        if subscription_ids:
+            print("🔍 Querying Azure Resource Graph for 1 selected subscription...")
+        else:
+            print("🔍 Querying Azure Resource Graph (fetching all resources)...")
         try:
-            result = subprocess.run(
-                cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE, 
-                text=True, 
-                check=True, 
-                env=env
-            )
-            
-            response = json.loads(result.stdout)
-            data = response.get('data', [])
-            all_resources.extend(data)
-            
-            # Check if Azure gave us a token for the next page
-            skip_token = response.get('skip_token')
-            
-            if not skip_token:
-                break # No more data, stop looping
-                
-            print(f"   ...fetched {len(all_resources)} resources so far...")
-            
+            all_resources = _arg_query_single_scope(env=env, subscription_ids=subscription_ids)
         except subprocess.CalledProcessError as e:
             print(f"❌ Failed ARG query: {e.stderr}")
-            break
-            
+            all_resources = []
+
     print(f"✅ Total resources fetched: {len(all_resources)}")
     return all_resources
 
@@ -473,8 +499,37 @@ def enrich_vm_network_details(resources, nic_ip_map, env=None):
         res["Subnet Prefix"] = subnet_prefix or "None"  # CIDR
         res["Public IP"] = public_ip or "None"
 
+def _export_empty_workbook(sub_map):
+    """Write a valid, minimal workbook when a subscription has 0 resources.
+
+    An empty subscription is NOT a failure. We still emit an AllResources sheet
+    so the job completes cleanly and the combined report is generated even when
+    one (or all) of the selected subscriptions has no resources.
+    """
+    unique_id = str(uuid.uuid4())[:8]
+    file_name = f"{ExcelExportConfig.FILE_NAME_PREFIX}_{datetime.now().strftime(ExcelExportConfig.FILE_NAME_DATE_FORMAT)}_{unique_id}.xlsx"
+    file_path = os.path.join(tempfile.gettempdir(), file_name)
+    empty_df = pd.DataFrame(
+        columns=["Name", "Resource Type", "Resource Group", "Location", "Subscription", "Type"]
+    )
+    with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+        empty_df.to_excel(writer, sheet_name="AllResources", index=False)
+        ws = writer.sheets["AllResources"]
+        note_row = len(empty_df) + 3
+        ws.cell(row=note_row, column=1,
+                value="No resources found for the selected subscription(s).")
+        for offset, (sid, name) in enumerate((sub_map or {}).items(), start=1):
+            ws.cell(row=note_row + offset, column=1,
+                    value=f"Subscription: {name} ({sid}) - 0 resources")
+    print(f"✅ Export complete: {file_path}")
+    return file_path
+
+
 def export_to_excel(resources, sub_map, friendly_map, schema_map):
     if not resources:
+        # Empty subscription -> emit a minimal workbook instead of failing.
+        return _export_empty_workbook(sub_map)
+    if not resources:  # unreachable legacy guard (kept to preserve original body below)
         print("âš ï¸ No data to export.")
         return None
 
@@ -1206,79 +1261,88 @@ def add_iam_roles_sheet(file_path, subscription_ids=None, env=None):
     wb.save(file_path)
     print(f"   ✅ IAM Roles sheet created with {len(role_assignments)} assignments")
 
-def create_simple_dashboard(file_path, resources):
-    """Create a simple dashboard showing only resource type counts."""
-    print("📊 Creating simple Dashboard...")
-    
-    wb = load_workbook(file_path)
-    
-    # Count resources by type
-    from collections import Counter
-    type_counts = Counter(res.get("Type", "Unknown") for res in resources)
-    
-    # Create Dashboard sheet
-    sheet_name = "Dashboard"
-    if sheet_name in wb.sheetnames:
-        del wb[sheet_name]
-    ws = wb.create_sheet(title=sheet_name, index=0)  # First sheet
-    
-    # Style definitions
-    header_fill = PatternFill(start_color='00B0F0', end_color='00B0F0', fill_type='solid')
-    header_font = Font(color='FFFFFF', bold=True, size=12)
-    total_fill = PatternFill(start_color='FFD966', end_color='FFD966', fill_type='solid')
-    total_font = Font(bold=True, size=11)
-    border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                   top=Side(style='thin'), bottom=Side(style='thin'))
-    
-    # Headers
-    ws.append(["Resource Type", "Count"])
-    ws['A1'].font = header_font
-    ws['A1'].fill = header_fill
-    ws['A1'].border = border
-    ws['B1'].font = header_font
-    ws['B1'].fill = header_fill
-    ws['B1'].border = border
-    
-    # Add data rows (sorted by count descending)
-    for resource_type, count in sorted(type_counts.items(), key=lambda x: x[1], reverse=True):
-        ws.append([resource_type, count])
-        row_num = ws.max_row
-        ws[f'A{row_num}'].border = border
-        ws[f'B{row_num}'].border = border
-    
-    # Add total row
-    total_resources = len(resources)
-    ws.append(["TOTAL", total_resources])
-    total_row = ws.max_row
-    ws[f'A{total_row}'].font = total_font
-    ws[f'A{total_row}'].fill = total_fill
-    ws[f'A{total_row}'].border = border
-    ws[f'B{total_row}'].font = total_font
-    ws[f'B{total_row}'].fill = total_fill
-    ws[f'B{total_row}'].border = border
-    
-    # Auto-fit columns
-    ws.column_dimensions['A'].width = 50
-    ws.column_dimensions['B'].width = 15
-    
-    wb.save(file_path)
-    print(f"   ✅ Simple Dashboard created with {len(type_counts)} resource types")
+def fetch_all_resource_groups(env=None, subscription_ids=None):
+    """Query ARG `resourcecontainers` for every RG with its original-case name.
 
-def add_rg_summary_sheet(file_path, resources):
-    """Add a sheet named 'RG' showing resource counts per resource group."""
+    ARG's `resourceGroup` field on individual resources is normalized to
+    lowercase, and RGs that contain only filtered-out resources never show
+    up in the resource list at all. Querying `resourcecontainers` directly
+    returns the canonical RG record (case-preserved `name`) for every RG
+    the caller has read access to — regardless of what's inside.
+    """
+    query = "resourcecontainers | where type == 'microsoft.resources/subscriptions/resourcegroups' | project name, subscriptionId, location"
+    rgs = []
+    skip_token = None
+    try:
+        while True:
+            cmd = [
+                "az", "graph", "query",
+                "-q", query,
+                "--first", str(AzureResourceGraphConfig.BATCH_SIZE),
+                "--output", "json",
+            ]
+            if subscription_ids:
+                cmd.extend(["--subscriptions"] + list(subscription_ids))
+            if skip_token:
+                cmd.extend(["--skip-token", skip_token])
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, check=True, env=env)
+            response = json.loads(result.stdout)
+            rgs.extend(response.get("data", []))
+            skip_token = response.get("skip_token")
+            if not skip_token:
+                break
+        print(f"✅ Fetched {len(rgs)} resource groups from ARG")
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️ Could not fetch resource groups: {e.stderr}")
+    except Exception as e:
+        print(f"⚠️ Could not fetch resource groups: {e}")
+    return rgs
+
+
+def add_rg_summary_sheet(file_path, resources, all_rgs=None):
+    """Add a sheet named 'RG' showing resource counts per resource group.
+
+    ``all_rgs`` is the canonical list from ARG's resourcecontainers query.
+    When provided, EVERY resource group appears — even those whose only
+    resources were filtered by EXCLUDE_KEYWORDS (e.g., NetworkWatcherRG).
+    RG names are also shown in their original case (Azure preserves it in
+    the container record; the per-resource `resourceGroup` field is
+    lower-cased, which is why the previous report showed 'production'
+    instead of 'Production').
+    """
     print("📂 Adding RG summary sheet...")
-    
-    rg_counts = Counter(res.get("resourceGroup", "Unknown") for res in resources if res.get("resourceGroup"))
-    
+
+    # Case-insensitive count from surviving resources.
+    rg_counts_lower = Counter(
+        (res.get("resourceGroup") or "Unknown").lower()
+        for res in resources
+        if res.get("resourceGroup")
+    )
+
+    # Build canonical (case-preserved) name → count map. Seed from the
+    # ARG resourcecontainers query so RGs with 0 surviving resources still
+    # appear; fall back to whatever case the resources gave us.
+    rg_counts = {}
+    if all_rgs:
+        for rg in all_rgs:
+            canonical = rg.get("name")
+            if canonical:
+                rg_counts[canonical] = rg_counts_lower.get(canonical.lower(), 0)
+    # Any resource-derived RG not in the canonical list (shouldn't happen
+    # normally, but be defensive if the resourcecontainers query failed
+    # or the RG lives in a subscription the query didn't cover).
+    seen_lower = {n.lower() for n in rg_counts}
+    for lower_name, count in rg_counts_lower.items():
+        if lower_name not in seen_lower:
+            rg_counts[lower_name] = count
+
     wb = load_workbook(file_path)
     sheet_name = "RG"
     if sheet_name in wb.sheetnames:
         del wb[sheet_name]
     
-    # Position: After AllResources (which is usually at index 0 or 1 depending on Dashboard)
-    # create_simple_dashboard puts Dashboard at index 0.
-    # export_to_excel puts AllResources at the first sheet (which becomes 0 if no dashboard yet).
-    # We'll just append it or insert at index 1.
+    # Position the summary directly after AllResources.
     ws = wb.create_sheet(title=sheet_name, index=1)
     
     # Style definitions
@@ -1563,16 +1627,88 @@ def run_assessment(subscription_ids=None, env=None):
     raw_resources = query_azure_resource_graph(env=env, subscription_ids=target_sub_ids)
     print(f"🔍 Raw resources fetched: {len(raw_resources)}")
 
-    # Use exclude keywords from config
+    # Diagnostic: per-type counts BEFORE filtering
+    raw_type_counts = Counter((r.get("type") or "").lower() for r in raw_resources)
+    raw_sub_counts = Counter((r.get("subscriptionId") or "").lower() for r in raw_resources)
+    print("📊 [DIAG] Raw resource counts by type (top 30):")
+    for t, c in raw_type_counts.most_common(30):
+        print(f"     {c:5d}  {t}")
+    print(f"📊 [DIAG] Raw resource subscriptions seen ({len(raw_sub_counts)}):")
+    for sid, c in raw_sub_counts.most_common():
+        print(f"     {c:5d}  {sid}")
+
+    # Use exclude keywords from config. IMPORTANT: matched resources are NOT
+    # dropped anymore — they're TAGGED with `is_hidden_type=True`. The full
+    # set (`resources`) still goes into every report sheet (All Resources,
+    # RG summary, per-type sheets) so the total matches what the Azure
+    # portal shows. Only the migration analysis / dashboard's "top blocking
+    # / critical action" logic filters them out — those are internal/system
+    # resources (NetworkWatcher, backup fabrics, hidden monitor rules) that
+    # shouldn't drive migration decisions.
     exclude_keywords = AzureResourceGraphConfig.EXCLUDE_KEYWORDS
+    selected_subs_lower = [s.lower() for s in sub_map.keys()]
 
-    resources = [
-        res for res in raw_resources
-        if not any(kw in res.get("type", "").lower() for kw in exclude_keywords)
-        and (not subscription_ids or (res.get("subscriptionId") or "").lower() in [s.lower() for s in sub_map.keys()])
+    hidden_count = Counter()              # type -> count (informational)
+    dropped_by_subfilter = Counter()      # subscriptionId -> count (still dropped)
+    hidden_examples = defaultdict(list)   # type -> [example resource names]
+    resources = []
+    for res in raw_resources:
+        rtype = (res.get("type") or "").lower()
+        rsub = (res.get("subscriptionId") or "").lower()
+        # Subscription filter still drops — if the user picked a subset of
+        # subscriptions, resources in other subs genuinely shouldn't appear.
+        if subscription_ids and rsub not in selected_subs_lower:
+            dropped_by_subfilter[rsub] += 1
+            continue
+        # Hidden-type filter now tags instead of drops.
+        matched_kw = next((kw for kw in exclude_keywords if kw in rtype), None)
+        if matched_kw:
+            res["is_hidden_type"] = True
+            res["_hidden_reason"] = matched_kw
+            hidden_count[f"{rtype}  (kw='{matched_kw}')"] += 1
+            if len(hidden_examples[rtype]) < 3:
+                hidden_examples[rtype].append(res.get("name", "?"))
+        else:
+            res["is_hidden_type"] = False
+        resources.append(res)
+
+    hidden_total = sum(1 for r in resources if r.get("is_hidden_type"))
+    print(f"✅ Resources in scope: {len(resources)} (of which {hidden_total} are tagged hidden for analysis)")
+    print(f"📊 [DIAG] Hidden-type tagged (still shown in All Resources / RG): {sum(hidden_count.values())}")
+    for label, c in hidden_count.most_common():
+        rtype_only = label.split("  (kw=")[0]
+        ex = hidden_examples.get(rtype_only, [])
+        print(f"     {c:5d}  {label}   examples={ex}")
+    if subscription_ids:
+        print(f"📊 [DIAG] Dropped by SUBSCRIPTION filter: {sum(dropped_by_subfilter.values())}")
+        for sid, c in dropped_by_subfilter.most_common():
+            print(f"     {c:5d}  {sid}")
+        print(f"📊 [DIAG] Selected subscriptions: {selected_subs_lower}")
+    else:
+        print("📊 [DIAG] No subscription filter applied (all subs in scope).")
+
+    # Per-type counts AFTER filtering
+    surviving_type_counts = Counter((r.get("type") or "").lower() for r in resources)
+    print("📊 [DIAG] Surviving resource counts by type (top 30):")
+    for t, c in surviving_type_counts.most_common(30):
+        delta = raw_type_counts.get(t, 0) - c
+        marker = f"  (-{delta} dropped)" if delta else ""
+        print(f"     {c:5d}  {t}{marker}")
+
+    # Spotlight on commonly-asked-about types
+    spotlight_types = [
+        "microsoft.network/publicipaddresses",
+        "microsoft.network/networkinterfaces",
+        "microsoft.compute/virtualmachines",
+        "microsoft.network/loadbalancers",
+        "microsoft.network/virtualnetworks",
+        "microsoft.storage/storageaccounts",
     ]
-
-    print(f"✅ Resources surviving filters: {len(resources)}")
+    print("📊 [DIAG] Spotlight (raw -> surviving):")
+    for t in spotlight_types:
+        r = raw_type_counts.get(t, 0)
+        s = surviving_type_counts.get(t, 0)
+        print(f"     {t}: {r} -> {s}")
 
     print("🌐 Building NIC to Public IP map...")
     nic_ip_map = build_nic_to_public_ip_map(env=env, subscription_ids=target_sub_ids)
@@ -1620,15 +1756,33 @@ def run_assessment(subscription_ids=None, env=None):
     print("ðŸ“„ Exporting to Excel...")
     file_path = export_to_excel(resources, sub_map, friendly_map, {})
 
+    if file_path and not resources:
+        # Empty subscription(s): export_to_excel already wrote a valid minimal
+        # workbook. Skip migration/dashboard/quota/IAM analysis since there is
+        # nothing to analyze and those steps assume resource data.
+        print("No resources to analyze - skipping migration/dashboard/quota/IAM steps.")
+        return file_path
+
     if file_path:
         print("ðŸŽ¨ Formatting Excel file...")
         format_excel_with_openpyxl(file_path)
 
-        # Add RG summary sheet
-        add_rg_summary_sheet(file_path, resources)
+        # Add RG summary sheet — fetch the canonical RG list from ARG's
+        # resourcecontainers so ALL groups appear (even empty ones and ones
+        # whose only resources were filtered) and names keep their case.
+        all_rgs = fetch_all_resource_groups(env=env, subscription_ids=target_sub_ids)
+        add_rg_summary_sheet(file_path, resources, all_rgs=all_rgs)
 
-        print("📊 Adding migration plan with dependency analysis...")
-        migration_plan = add_migration_plan_sheets(file_path, resources, sub_map)
+        # Migration analysis (and its downstream dashboard) sees ONLY the
+        # non-hidden resources. Hidden types (NetworkWatcher, backup fabrics,
+        # etc.) are still in the report sheets above, but they shouldn't
+        # drive migration decisions or appear as top blockers in the
+        # dashboard's critical-action panel.
+        resources_for_analysis = [r for r in resources if not r.get("is_hidden_type")]
+        print(f"📊 Adding migration plan with dependency analysis "
+              f"({len(resources_for_analysis)} resources, "
+              f"{len(resources) - len(resources_for_analysis)} hidden types skipped)...")
+        migration_plan = add_migration_plan_sheets(file_path, resources_for_analysis, sub_map)
         
         print("📊 Adding high-level migration plan (aggregated by resource type)...")
         add_high_level_migration_plan(file_path, migration_plan, sub_map, friendly_map)
@@ -1657,7 +1811,13 @@ def run_assessment(subscription_ids=None, env=None):
         else:
             print("⏭️ Skipping quota analysis (ENABLE_QUOTA_ANALYSIS=false)")
         # Create Dashboard with comprehensive migration insights
-        create_improved_dashboard(file_path, migration_plan, sub_map, friendly_map)
+        # Dashboard shows portal-matching total (analyzed + hidden) but
+        # analysis breakdowns (Can Move / Blockers) only cover analyzed set.
+        create_improved_dashboard(
+            file_path, migration_plan, sub_map, friendly_map,
+            total_all_resources=len(resources),
+            hidden_count=len(resources) - len(resources_for_analysis),
+        )
         
         return file_path
     return None
@@ -1665,18 +1825,30 @@ def run_assessment(subscription_ids=None, env=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Azure Resource Assessment Script")
     parser.add_argument("--subscription-ids", nargs="*", help="List of subscription IDs to assess")
+    parser.add_argument(
+        "--workbook-mode",
+        choices=["combined", "per_subscription"],
+        default="combined",
+        help="Generate one combined workbook or one workbook per selected subscription",
+    )
     args = parser.parse_args()
-    
-    run_assessment(subscription_ids=args.subscription_ids)
 
-def run_assessment_with_device_code(subscription_ids=None, env=None):
-    """
-    Run assessment after az CLI device code authentication.
-    Assumes az CLI is already authenticated.
-    """
-    print("🔍 Running assessment with Device Code authentication...")
-    print("✅ Using az CLI authenticated session")
-    return run_assessment(subscription_ids=subscription_ids, env=env)
+    if args.workbook_mode == "per_subscription" and args.subscription_ids and len(args.subscription_ids) > 1:
+        generated_files = []
+        for index, subscription_id in enumerate(args.subscription_ids, start=1):
+            print(
+                f"Generating workbook {index}/{len(args.subscription_ids)} "
+                f"for subscription {subscription_id}..."
+            )
+            file_path = run_assessment(subscription_ids=[subscription_id])
+            if file_path:
+                generated_files.append(file_path)
+        if len(generated_files) != len(args.subscription_ids):
+            raise SystemExit(
+                f"Generated {len(generated_files)} of {len(args.subscription_ids)} requested workbooks"
+            )
+    else:
+        run_assessment(subscription_ids=args.subscription_ids)
 
 def run_assessment_with_credential(credential, subscription_ids=None):
     """

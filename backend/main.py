@@ -8,6 +8,9 @@ import os
 import shutil
 import uuid
 import tempfile
+import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import openai
 import pandas as pd
 from typing import Optional
@@ -43,11 +46,11 @@ from auth_api import router as auth_router, device_code_sessions, gcp_oauth_sess
 app = FastAPI()
 
 # Include authentication router
-# Include authentication router
 app.include_router(auth_router)
 
 # In-memory job store for async assessments
 assessment_jobs = {}
+assessment_jobs_lock = threading.Lock()
 
 class LoginRequest(BaseModel):
     auth_type: str = "service_principal"  # service_principal, access_token
@@ -347,6 +350,8 @@ async def run_assessment_with_session(request: DeviceCodeAssessmentRequest):
 class CliDeviceCodeAssessmentRequest(BaseModel):
     session_id: str
     subscription_ids: Optional[list] = None
+    subscriptions: Optional[list] = None
+    workbook_mode: str = "combined"
 
 
 def update_job_progress(job_id: str, step: str, percentage: int, message: str = ""):
@@ -530,11 +535,225 @@ def process_gcp_assessment_job(job_id, request_dict):
         traceback.print_exc()
 
 
-def process_assessment_job(job_id: str, subscription_ids: list, env_dir: str):
+def _subscription_report_name(subscription_name: str) -> str:
+    """Create a safe, recognizable per-subscription workbook name."""
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", subscription_name or "subscription")
+    safe_name = safe_name.strip("._-") or "subscription"
+    return f"{ExcelExportConfig.FILE_NAME_PREFIX}_{safe_name}_{uuid.uuid4().hex[:8]}.xlsx"
+
+
+PARALLEL_PROGRESS_EVENTS = (
+    ("Fetching subscription names", 5, "Authenticating"),
+    ("Querying Azure Resource Graph", 15, "Fetching resources"),
+    ("Building NIC to Public IP map", 25, "Building network mappings"),
+    ("Enriching VM resources", 30, "Enriching resources"),
+    ("Exporting to Excel", 40, "Exporting workbook"),
+    ("Formatting Excel file", 50, "Formatting workbook"),
+    ("Adding migration plan with dependency analysis", 60, "Analyzing migration"),
+    ("Appending quota info", 90, "Adding quota information"),
+    ("Creating dashboard", 95, "Creating dashboard"),
+)
+
+
+def _update_parallel_worker_progress(job_id, subscription_id, subscription_name, percentage, step):
+    """Update aggregate progress without allowing slower workers to move it backwards."""
+    with assessment_jobs_lock:
+        job = assessment_jobs.get(job_id)
+        if not job or job.get("status") == "cancelled":
+            return
+        worker_progress = job.setdefault("_worker_progress", {})
+        worker_progress[subscription_id] = max(
+            percentage,
+            worker_progress.get(subscription_id, 0),
+        )
+        total_workers = max(len(worker_progress), 1)
+        aggregate = int(sum(worker_progress.values()) / total_workers)
+        current_percentage = job.get("progress", {}).get("percentage", 0)
+        job["progress"] = {
+            "step": step,
+            "percentage": min(max(aggregate, current_percentage), 99),
+            "message": f"{subscription_name}: {step}",
+        }
+
+
+def _run_subscription_process(job_id, subscription_id, subscription_name, env_dir):
+    """Run one subscription in an isolated Azure CLI environment."""
+    worker_env_dir = tempfile.mkdtemp(prefix=f"az_assessment_{subscription_id[:8]}_")
+    try:
+        if env_dir and os.path.isdir(env_dir):
+            shutil.copytree(env_dir, worker_env_dir, dirs_exist_ok=True)
+
+        custom_env = os.environ.copy()
+        custom_env["PYTHONUNBUFFERED"] = "1"
+        custom_env["PYTHONIOENCODING"] = "utf-8"
+        custom_env["AZURE_CONFIG_DIR"] = worker_env_dir
+
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "script.py")
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                script_path,
+                "--subscription-ids",
+                subscription_id,
+                "--workbook-mode",
+                "combined",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=custom_env,
+            encoding="utf-8",
+            errors="replace",
+        )
+        assessment_jobs[job_id].setdefault("processes", {})[subscription_id] = process
+
+        exported_paths = []
+        for raw_line in iter(process.stdout.readline, ""):
+            line = raw_line.strip()
+            if line:
+                print(f"[Script:{subscription_name}] {line}")
+                for keyword, percentage, step in PARALLEL_PROGRESS_EVENTS:
+                    if keyword in line:
+                        _update_parallel_worker_progress(
+                            job_id,
+                            subscription_id,
+                            subscription_name,
+                            percentage,
+                            step,
+                        )
+                        break
+                if "Export complete:" in line:
+                    exported_path = line.split("Export complete:", 1)[1].strip()
+                    if exported_path not in exported_paths:
+                        exported_paths.append(exported_path)
+
+        process.wait()
+        completed_paths = [path for path in exported_paths if os.path.isfile(path)]
+        if process.returncode != 0 or not completed_paths:
+            _update_parallel_worker_progress(
+                job_id, subscription_id, subscription_name, 100, "Finished with errors"
+            )
+            return None, f"Assessment failed for {subscription_name} (exit code {process.returncode})"
+
+        source_path = completed_paths[-1]
+        named_path = os.path.join(
+            os.path.dirname(source_path),
+            _subscription_report_name(subscription_name),
+        )
+        os.replace(source_path, named_path)
+        _update_parallel_worker_progress(
+            job_id, subscription_id, subscription_name, 100, "Workbook ready"
+        )
+        return {
+            "file_path": os.path.abspath(named_path),
+            "file_name": os.path.basename(named_path),
+            "subscription_id": subscription_id,
+            "subscription_name": subscription_name,
+        }, None
+    except Exception as exc:
+        _update_parallel_worker_progress(
+            job_id, subscription_id, subscription_name, 100, "Finished with errors"
+        )
+        return None, f"Assessment failed for {subscription_name}: {exc}"
+    finally:
+        assessment_jobs.get(job_id, {}).get("processes", {}).pop(subscription_id, None)
+        shutil.rmtree(worker_env_dir, ignore_errors=True)
+
+
+def _process_parallel_subscription_jobs(job_id, subscription_ids, env_dir, subscriptions):
+    """Generate subscription workbooks concurrently and publish each as it completes."""
+    started_at = datetime.now()
+    metadata = {
+        str(item.get("subscription_id", "")).lower(): item.get("display_name")
+        for item in (subscriptions or [])
+        if isinstance(item, dict)
+    }
+    names = {
+        subscription_id: metadata.get(subscription_id.lower()) or subscription_id
+        for subscription_id in subscription_ids
+    }
+    result = {
+        "status": "running",
+        "message": "Generating subscription workbooks in parallel.",
+        "workbook_mode": "per_subscription",
+        "files": [],
+        "total_files": len(subscription_ids),
+        "completed_files": 0,
+    }
+    assessment_jobs[job_id]["result"] = result
+    assessment_jobs[job_id]["processes"] = {}
+    assessment_jobs[job_id]["_worker_progress"] = {
+        subscription_id: 0 for subscription_id in subscription_ids
+    }
+
+    errors = []
+    max_workers = min(len(subscription_ids), 4)
+    update_job_progress(job_id, "Running in parallel", 5, f"Starting {len(subscription_ids)} subscription assessments...")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(
+                _run_subscription_process,
+                job_id,
+                subscription_id,
+                names[subscription_id],
+                env_dir,
+            ): subscription_id
+            for subscription_id in subscription_ids
+        }
+        for future in as_completed(futures):
+            file_result, error = future.result()
+            if file_result:
+                result["files"].append(file_result)
+                result["completed_files"] = len(result["files"])
+            if error:
+                errors.append(error)
+
+    assessment_jobs[job_id].pop("processes", None)
+    assessment_jobs[job_id].pop("_worker_progress", None)
+    if assessment_jobs[job_id].get("status") == "cancelled":
+        return
+
+    duration_sec = int((datetime.now() - started_at).total_seconds())
+    duration_str = f"{duration_sec // 60}m {duration_sec % 60}s" if duration_sec > 60 else f"{duration_sec}s"
+    result["duration"] = duration_str
+    if errors:
+        result["errors"] = errors
+
+    if result["files"]:
+        result["status"] = "warning" if errors else "success"
+        result["message"] = (
+            f"{len(result['files'])} of {len(subscription_ids)} workbooks completed."
+            if errors
+            else f"All {len(subscription_ids)} subscription workbooks completed."
+        )
+        assessment_jobs[job_id]["status"] = "completed"
+        assessment_jobs[job_id]["duration"] = duration_str
+        update_job_progress(job_id, "Completed", 100, result["message"])
+    else:
+        assessment_jobs[job_id]["status"] = "failed"
+        assessment_jobs[job_id]["error"] = "; ".join(errors) or "No workbook was generated."
+
+
+def process_assessment_job(
+    job_id: str,
+    subscription_ids: list,
+    env_dir: str,
+    workbook_mode: str = "combined",
+    subscriptions: Optional[list] = None,
+):
+    """Run an assessment in cancellable subprocesses."""
     import time
     start_time = time.time()
-    """Background task to run assessment via subprocess to allow cancellation"""
-    import sys
+
+    if workbook_mode == "per_subscription" and subscription_ids and len(subscription_ids) > 1:
+        _process_parallel_subscription_jobs(
+            job_id,
+            subscription_ids,
+            env_dir,
+            subscriptions,
+        )
+        return
     
     print(f"🚀 Starting background job {job_id}")
     
@@ -570,7 +789,6 @@ def process_assessment_job(job_id: str, subscription_ids: list, env_dir: str):
         # Track AI analysis progress
         if ai_analysis_started and "📊 Progress:" in text:
             try:
-                import re
                 match = re.search(r'(\d+)/(\d+)\s+\((\d+)%\)', text)
                 if match:
                     ai_completion_pct = int(match.group(3))
@@ -604,6 +822,7 @@ def process_assessment_job(job_id: str, subscription_ids: list, env_dir: str):
         cmd = [sys.executable, script_path]
         if subscription_ids:
             cmd.extend(["--subscription-ids"] + subscription_ids)
+        cmd.extend(["--workbook-mode", workbook_mode])
             
         # Start subprocess
         process = subprocess.Popen(
@@ -621,7 +840,7 @@ def process_assessment_job(job_id: str, subscription_ids: list, env_dir: str):
             assessment_jobs[job_id]["process"] = process
             
         # Read output
-        file_path = None
+        file_paths = []
         for line in iter(process.stdout.readline, ''):
             line = line.strip()
             if line:
@@ -630,7 +849,9 @@ def process_assessment_job(job_id: str, subscription_ids: list, env_dir: str):
                 if "✅ Export complete:" in line:
                     parts = line.split(": ")
                     if len(parts) > 1:
-                        file_path = parts[1].strip()
+                        exported_path = parts[1].strip()
+                        if exported_path not in file_paths:
+                            file_paths.append(exported_path)
                         
         process.wait()
         
@@ -638,20 +859,36 @@ def process_assessment_job(job_id: str, subscription_ids: list, env_dir: str):
         if job_id in assessment_jobs and "process" in assessment_jobs[job_id]:
             del assessment_jobs[job_id]["process"]
             
-        if process.returncode == 0 and file_path and os.path.exists(file_path):
+        completed_files = [path for path in file_paths if os.path.exists(path)]
+        if process.returncode == 0 and completed_files:
             duration_sec = int(time.time() - start_time)
             duration_str = f"{duration_sec // 60}m {duration_sec % 60}s" if duration_sec > 60 else f"{duration_sec}s"
 
             update_job_progress(job_id, "Completed", 100, f"Assessment complete! (Time: {duration_str})")
             assessment_jobs[job_id]["status"] = "completed"
             assessment_jobs[job_id]["duration"] = duration_str
-            assessment_jobs[job_id]["result"] = {
+            result = {
                 "status": "success",
-                "file_path": os.path.abspath(file_path),
-                "file_name": os.path.basename(file_path),
                 "message": f"Azure assessment complete. (Total Time: {duration_str})",
-                "duration": duration_str
+                "duration": duration_str,
+                "workbook_mode": workbook_mode,
+                "files": [
+                    {
+                        "file_path": os.path.abspath(path),
+                        "file_name": os.path.basename(path),
+                        "subscription_id": (
+                            subscription_ids[index]
+                            if workbook_mode == "per_subscription" and subscription_ids and index < len(subscription_ids)
+                            else None
+                        ),
+                    }
+                    for index, path in enumerate(completed_files)
+                ],
             }
+            if workbook_mode == "combined" or len(completed_files) == 1:
+                result["file_path"] = os.path.abspath(completed_files[0])
+                result["file_name"] = os.path.basename(completed_files[0])
+            assessment_jobs[job_id]["result"] = result
             print(f"✅ Job {job_id} completed successfully in {duration_str}")
         else:
             # Check if cancelled
@@ -675,6 +912,16 @@ def cancel_assessment(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     
+    if "processes" in job:
+        processes = list(job["processes"].values())
+        for process in processes:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+        job["status"] = "cancelled"
+        job["progress"]["message"] = "Assessment cancelled by user."
+        return {"status": "success", "message": "Parallel assessments cancelled"}
     if "process" in job:
         process = job["process"]
         try:
@@ -700,6 +947,10 @@ def get_assessment_status(job_id: str):
     job_response = job.copy()
     if "process" in job_response:
         del job_response["process"]
+    if "processes" in job_response:
+        del job_response["processes"]
+    if "_worker_progress" in job_response:
+        del job_response["_worker_progress"]
         
     return job_response
 
@@ -718,6 +969,9 @@ def run_assessment_with_cli_session(request: CliDeviceCodeAssessmentRequest, bac
     
     if session["status"] != "completed":
         raise HTTPException(status_code=401, detail=f"Session not authenticated. Status: {session['status']}")
+
+    if request.workbook_mode not in {"combined", "per_subscription"}:
+        raise HTTPException(status_code=400, detail="workbook_mode must be 'combined' or 'per_subscription'")
     
     # Create a job ID
     job_id = str(uuid.uuid4())
@@ -740,7 +994,9 @@ def run_assessment_with_cli_session(request: CliDeviceCodeAssessmentRequest, bac
         process_assessment_job, 
         job_id, 
         request.subscription_ids, 
-        env_dir
+        env_dir,
+        request.workbook_mode,
+        request.subscriptions
     )
     
     print(f"🚀 Started async assessment job {job_id} for session {request.session_id}")

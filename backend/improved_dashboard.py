@@ -22,15 +22,25 @@ import os
 from datetime import datetime
 
 
-def create_improved_dashboard(file_path, resources, sub_map, friendly_map):
+def create_improved_dashboard(file_path, resources, sub_map, friendly_map,
+                              total_all_resources=None, hidden_count=0):
     """
     Create an improved dashboard with comprehensive migration insights.
-    
+
     Args:
         file_path: Path to the Excel file
         resources: List of resource dictionaries with migration analysis
+            (this is the filtered/analyzed set — hidden system types
+             already stripped so they don't drive Can Move / Cannot Move
+             / Top Blocker calculations)
         sub_map: Dictionary mapping subscription IDs to names
         friendly_map: Dictionary mapping resource types to friendly names
+        total_all_resources: Total resource count INCLUDING hidden system
+            types (matches the Azure portal count). Defaults to len(resources)
+            when not provided, preserving legacy behavior.
+        hidden_count: Number of hidden/system resources (NetworkWatcher,
+            backup fabrics, etc.) excluded from the migration analysis.
+            Shown as its own row so users see why analyzed < total.
     """
     wb = load_workbook(file_path)
     
@@ -70,17 +80,25 @@ def create_improved_dashboard(file_path, resources, sub_map, friendly_map):
     center_align = Alignment(horizontal='center', vertical='center')
     
     # Analyze resources
-    total_resources = len(resources)
+    # `resources` is the filtered set (hidden system types already excluded).
+    # `analyzed_count` is what drives all Can Move / Cannot Move / Action /
+    # Review percentages so those numbers reflect only migratable workloads.
+    # `total_resources` is the portal-matching count (analyzed + hidden) so
+    # the Executive Summary matches what a user sees in Azure Portal.
+    analyzed_count = len(resources)
+    total_resources = total_all_resources if total_all_resources is not None else analyzed_count
     can_move = sum(1 for r in resources if r.get('Move Status') == 'Can Move')
     cannot_move = sum(1 for r in resources if r.get('Move Status') == 'Cannot Move')
     action_required = sum(1 for r in resources if r.get('Move Status') in ['Dependent - Action Required', 'Action Required'])
     review_required = sum(1 for r in resources if r.get('Move Status') == 'Review Required')
-    
-    # Calculate percentages
-    can_move_pct = (can_move / total_resources * 100) if total_resources > 0 else 0
-    cannot_move_pct = (cannot_move / total_resources * 100) if total_resources > 0 else 0
-    action_pct = (action_required / total_resources * 100) if total_resources > 0 else 0
-    review_pct = (review_required / total_resources * 100) if total_resources > 0 else 0
+
+    # Percentages are computed over the ANALYZED set (excludes hidden), so
+    # "X% Can Move" isn't diluted by system resources we're not migrating.
+    denom = analyzed_count if analyzed_count > 0 else 1
+    can_move_pct = (can_move / denom * 100)
+    cannot_move_pct = (cannot_move / denom * 100)
+    action_pct = (action_required / denom * 100)
+    review_pct = (review_required / denom * 100)
     
     current_row = 1
     
@@ -121,13 +139,22 @@ def create_improved_dashboard(file_path, resources, sub_map, friendly_map):
         cell.alignment = center_align
     current_row += 1
     
-    # Summary data
+    # Summary data. The first row is portal-matching (Analyzed + Hidden).
+    # The second row is the analyzed subset (excludes hidden system types).
+    # All the move-status rows are % of ANALYZED, not of total.
     summary_data = [
-        ('Total Resources', total_resources, 1.0, None),
-        ('✅ Can Move', can_move, can_move_pct / 100, green_fill),
-        ('❌ Cannot Move', cannot_move, cannot_move_pct / 100, red_fill),
-        ('⚠️ Can Move (Action Required)', action_required, action_pct / 100, yellow_fill),
-        ('❓ Review Required', review_required, review_pct / 100, gray_fill)
+        ('Total Resources (matches Azure Portal)', total_resources, 1.0, None),
+    ]
+    if hidden_count and hidden_count > 0:
+        summary_data.append(('  Hidden/System (excluded from analysis)', hidden_count,
+                             (hidden_count / total_resources) if total_resources else 0, gray_fill))
+        summary_data.append(('  Analyzed for migration',                 analyzed_count,
+                             (analyzed_count / total_resources) if total_resources else 0, None))
+    summary_data += [
+        ('✅ Can Move',                                                   can_move,           can_move_pct / 100,   green_fill),
+        ('❌ Cannot Move',                                                cannot_move,        cannot_move_pct / 100, red_fill),
+        ('⚠️ Can Move (Action Required)',                                 action_required,    action_pct / 100,     yellow_fill),
+        ('❓ Review Required',                                            review_required,    review_pct / 100,     gray_fill),
     ]
     
     for label, count, pct, fill in summary_data:

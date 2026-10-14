@@ -757,7 +757,6 @@ OUTPUT (JSON only, no markdown):
                         {"role": "system", "content": "You are an Azure migration expert. Analyze based on concrete dependency facts and documentation."},
                         {"role": "user", "content": prompt}
                     ],
-                    temperature=AzureOpenAIConfig.TEMPERATURE,
                     response_format={"type": "json_object"}
                 )
                 break # Success, exit loop

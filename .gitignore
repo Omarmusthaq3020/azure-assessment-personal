@@ -44,6 +44,11 @@ package-lock.json
 *.swp
 *.swo
 
+# Agent / assistant local tooling (machine-local, not for the shared repo)
+.claude/
+.agent/
+.env.example.local
+
 # Generated Reports & Data
 *.xlsx
 *.csv
