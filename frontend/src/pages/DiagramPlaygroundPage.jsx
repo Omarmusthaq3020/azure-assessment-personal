@@ -106,9 +106,8 @@ export default function DiagramPlaygroundPage() {
                                 onChange={(e) => setDiagramType(e.target.value)}
                                 className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white"
                             >
-                                <option value="network">Network Topology</option>
-                                <option value="resource_groups">Resource Groups</option>
-                                <option value="migration">Migration Readiness</option>
+                                <option value="network">Complete Architecture (with peering)</option>
+                                <option value="resource_groups">Resource Group wise</option>
                             </select>
                         </div>
                         <div>

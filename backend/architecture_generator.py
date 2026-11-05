@@ -13,7 +13,7 @@ import os
 import sys
 import re
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, Counter
 from typing import Dict, List, Optional
 from urllib.parse import quote
 import xml.etree.ElementTree as ET
@@ -1051,6 +1051,38 @@ def _extract_azure_summary(wb, sheet_names: list) -> dict:
     ]:
         summary[bucket] = _dedupe_by_name_rg(summary.get(bucket, []))
 
+    # ---- Subscription mapping (for subscription swim-lanes in the diagram) ----
+    # AllResources maps every resource name → its subscription ID; a few sheets
+    # (e.g. SQL VMs) also carry a friendly "Subscription Name" we can reuse.
+    name_to_sub = {}       # resource name (lower) → subscription id
+    sub_id_to_name = {}    # subscription id (lower) → friendly name
+    all_sheet = _find_sheet_prefer_exact(sheet_names, ["AllResources"], ["allresources"])
+    if all_sheet:
+        for r in _sheet_to_records(wb, all_sheet, max_rows=5000):
+            nm = str(_pick(r, "Name", "name") or "").strip().lower()
+            sid = str(_pick(r, "Subscription", "subscriptionId", "Subscriptionid") or "").strip().lower()
+            if nm and sid:
+                name_to_sub.setdefault(nm, sid)
+    # Harvest id→name from any sheet that carries both columns.
+    for sh in sheet_names:
+        try:
+            recs = _sheet_to_records(wb, sh, max_rows=300)
+        except Exception:
+            continue
+        got = False
+        for r in recs:
+            sid = str(_pick(r, "Subscriptionid", "subscriptionId", "Subscription Id") or "").strip().lower()
+            snm = str(_pick(r, "Subscription Name", "subscriptionName") or "").strip()
+            if sid and len(sid) >= 30 and snm:
+                sub_id_to_name.setdefault(sid, snm)
+                got = True
+        # keep scanning; cheap enough, and different sheets cover different subs
+    summary["subscription_names"] = sub_id_to_name
+    for net in summary.get("networks", []):
+        sid = name_to_sub.get(str(net.get("name") or "").strip().lower(), "")
+        net["subscription_id"] = sid
+        net["subscription"] = sub_id_to_name.get(sid, "") or (f"Subscription {sid[:8]}" if sid else "Unknown subscription")
+
     return summary
 
 
@@ -1740,11 +1772,13 @@ def generate_architecture_diagram(
     cloud_type: str = None,
 ) -> dict:
     """
-    Main entry point: Extract data from Excel → Send to GPT → Return Mermaid code.
+    Main entry point: Extract data from Excel → build native draw.io XML.
+
+    draw.io is the ONLY supported output. Mermaid generation has been removed.
 
     Returns:
         {
-            "diagram": "<mermaid code>",
+            "drawio_xml": "<draw.io mxGraph XML>",
             "summary": { ... },
             "diagram_type": "network",
             "cloud": "azure"
@@ -1754,34 +1788,28 @@ def generate_architecture_diagram(
     print(f"🏗️ Extracting environment data from {os.path.basename(file_path)}...")
     summary = extract_environment_summary(file_path, cloud_type)
 
-    # 2. For Azure/AWS network diagrams, use deterministic layout first for consistency.
-    normalized_type = str(diagram_type or "").strip().lower()
-    if normalized_type in {"network", "architecture", "full", "complete"} and summary.get("cloud") == "azure":
-        print("🧭 Building deterministic Azure network topology diagram...")
-        diagram_code = _build_azure_network_diagram(summary)
-    elif normalized_type in {"network", "architecture", "full", "complete"} and summary.get("cloud") == "aws":
-        print("🧭 Building deterministic AWS network topology diagram...")
-        diagram_code = _build_aws_network_diagram(summary)
-    else:
-        # 2b. Build prompt
-        prompt = build_prompt(summary, diagram_type)
-
-        # 3. Call Azure OpenAI
-        print(f"🤖 Generating {diagram_type} architecture diagram via GPT...")
-        diagram_code = _call_openai(prompt)
-
-        # 4. Clean up the response
-        diagram_code = _clean_mermaid_output(diagram_code)
-
+    # 2. Build native draw.io XML. Two Azure views are supported:
+    #      - "resource_groups" → resources grouped by Resource Group
+    #      - anything else ("network"/"complete") → full nested architecture
+    #        (Region → VNet → Subnet → resources) WITH VNet peering arrows.
+    normalized_type = str(diagram_type or "network").strip().lower().replace("-", "_")
+    cloud = str(summary.get("cloud") or "").lower()
     drawio_xml = ""
     try:
-        if normalized_type in {"network", "architecture", "full", "complete"}:
+        if cloud == "azure" and normalized_type in {"resource_groups", "resourcegroups", "rg", "rgwise", "resource_group"}:
+            print("🧭 Building draw.io resource-group view...")
+            drawio_xml = _build_azure_drawio_rgwise(summary)
+        elif cloud == "azure":
+            print("🧭 Building complete draw.io architecture (with peering arrows)...")
+            drawio_xml = _build_azure_drawio_nested(summary, arrows=True)
+        else:
+            print("🧭 Building draw.io network topology diagram...")
             drawio_xml = _build_drawio_network_xml(summary)
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ draw.io generation failed: {e}")
         drawio_xml = ""
 
     return {
-        "diagram": diagram_code,
         "drawio_xml": drawio_xml,
         "summary": compact_summary(summary),
         "diagram_type": diagram_type,
@@ -2956,17 +2984,731 @@ def _build_aws_drawio_network_xml(summary: Dict) -> str:
     return ET.tostring(mxfile, encoding="unicode")
 
 
+def _xml_escape(value: str) -> str:
+    """Escape a string for use inside an XML attribute value."""
+    return (
+        str(value or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _clean_cidr(value: str) -> str:
+    """Turn an address space like "['10.0.0.0/24']" into "10.0.0.0/24"."""
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    s = s.strip("[]")
+    parts = [p.strip().strip("'\"") for p in s.split(",") if p.strip().strip("'\"")]
+    return ", ".join(parts)
+
+
+def _shelf_pack(sizes, max_w, gap):
+    """Pack (w, h) boxes left-to-right, wrapping when the row exceeds max_w.
+
+    Returns (positions, content_w, content_h) where positions[i] = (x, y) of
+    box i relative to the content origin (0, 0). Guarantees boxes never
+    overlap because each is advanced past the previous one plus `gap`.
+    """
+    positions = []
+    x = y = row_h = content_w = 0
+    for (w, h) in sizes:
+        if x > 0 and (x + w) > max_w:
+            x = 0
+            y += row_h + gap
+            row_h = 0
+        positions.append((x, y))
+        x += w + gap
+        row_h = max(row_h, h)
+        content_w = max(content_w, x - gap)
+    content_h = y + row_h
+    return positions, content_w, content_h
+
+
+def _build_azure_drawio_nested(summary: Dict, arrows: bool = False) -> str:
+    """Deterministic nested draw.io layout for Azure.
+
+    Hierarchy: Region → VNet → Subnet → resource icons. Every container is
+    auto-sized to exactly fit its children (packed with fixed gaps), so boxes
+    never overlap regardless of how many subnets/resources a VNet has. This
+    mirrors the curated IIFL-HFC reference layout.
+    """
+    # ---- layout constants (tuned to the IIFL-HFC reference template) ----
+    ICON_W, ICON_H = 36, 36            # native azure2 icon size (matches template)
+    CELL_W, CELL_H = 84, 58            # packing footprint per icon (label room)
+    G = 8                              # gap between siblings (→ ~92px column pitch)
+    SUB_PAD, SUB_HEADER = 8, 28        # subnet inner padding / title band
+    SUB_COLS = 6                       # max icons per row inside a subnet
+    MIN_SUBNET_W = 108
+    VNET_PAD, VNET_HEADER = 10, 30
+    VNET_MAXW = 1600                   # wrap subnets past this inner width
+    MIN_VNET_W = 150
+    REGION_PAD, REGION_HEADER = 12, 36
+    REGION_MAXW = 4200                 # wrap VNets past this inner width
+    MARGIN, REGION_GAP = 40, 44
+    MAX_ICONS_PER_BOX = 1000           # effectively uncapped — show every resource
+
+    networks = summary.get("networks", []) or []
+    subnets = summary.get("subnets", []) or []
+    compute = summary.get("compute", []) or []
+    vm_scale_sets = summary.get("vm_scale_sets", []) or []
+    aks_clusters = summary.get("aks_clusters", []) or []
+    load_balancers = summary.get("load_balancers", []) or []
+    application_gateways = summary.get("application_gateways", []) or []
+    private_endpoints = summary.get("private_endpoints", []) or []
+    databases = summary.get("database_services", []) or summary.get("databases", []) or []
+    storage_accounts = summary.get("storage_accounts", []) or summary.get("storage", []) or []
+    web_apps = summary.get("web_apps", []) or []
+    network_interfaces = summary.get("network_interfaces", []) or []
+
+    # Native draw.io Azure (azure2) stencil library paths — same as the template.
+    # These render as crisp built-in shapes (no embedded SVG) inside draw.io.
+    AZ2 = "img/lib/azure2"
+    icon = {
+        "vm": f"{AZ2}/compute/Virtual_Machine.svg",
+        "vmss": f"{AZ2}/compute/VM_Scale_Sets.svg",
+        "aks": f"{AZ2}/compute/Kubernetes_Services.svg",
+        "lb": f"{AZ2}/networking/Load_Balancers.svg",
+        "appgw": f"{AZ2}/networking/Application_Gateways.svg",
+        "pe": f"{AZ2}/networking/Private_Link.svg",
+        "sql": f"{AZ2}/databases/SQL_Database.svg",
+        "storage": f"{AZ2}/storage/Storage_Accounts.svg",
+        "web": f"{AZ2}/compute/App_Services.svg",
+        "vnet": f"{AZ2}/networking/Virtual_Networks.svg",
+    }
+
+    # ---- container styles (colors taken from the reference template) ----
+    _CBASE = ("rounded=1;arcSize=2;whiteSpace=wrap;html=1;verticalAlign=top;align=left;"
+              "spacingLeft=8;spacingTop=4;container=1;collapsible=0;")
+    S_REGION = _CBASE + "fillColor=#F7F7F7;strokeColor=#8A8A8A;fontStyle=1;fontSize=14;"
+    S_VNET = _CBASE + "fillColor=#EAF3FC;strokeColor=#1F6FC5;fontStyle=1;fontSize=12;"
+    S_SUBNET = _CBASE + "fillColor=#FFFFFF;strokeColor=#7FA9D9;fontSize=11;"
+    S_INV_REGION = _CBASE + "fillColor=#FFFFFF;strokeColor=#9E9E9E;fontStyle=1;fontSize=14;"
+    S_AKS_REGION = _CBASE + "fillColor=#FFFCF0;strokeColor=#D9A400;fontStyle=1;fontSize=14;"
+    S_AKS_BOX = ("rounded=1;arcSize=6;whiteSpace=wrap;html=1;container=1;collapsible=1;collapsed=1;"
+                 "verticalAlign=top;align=left;spacingLeft=8;fontSize=11;fontStyle=1;fillColor=#FFF7E6;strokeColor=#D9A400;")
+    # Native azure2 image shape (matches the template's icon styling exactly).
+    S_ICON = ("image;aspect=fixed;html=1;points=[];align=center;fontSize=9;"
+              "verticalLabelPosition=bottom;verticalAlign=top;labelBackgroundColor=none;whiteSpace=wrap;")
+    # Edge styles for connections.
+    E_PEER = "edgeStyle=none;rounded=1;html=1;endArrow=none;dashed=1;strokeColor=#C55A11;strokeWidth=1.5;"
+    E_CONN = "edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#16A085;strokeWidth=1.2;"
+
+    cells = []
+    _cid = {"n": 0}
+
+    def new_id(prefix="c"):
+        _cid["n"] += 1
+        return f"{prefix}{_cid['n']}"
+
+    def emit(cid, value, style, x, y, w, h, parent):
+        cells.append(
+            f'<mxCell id="{cid}" value="{_xml_escape(value)}" style="{_xml_escape(style)}" '
+            f'vertex="1" parent="{parent}">'
+            f'<mxGeometry x="{int(x)}" y="{int(y)}" width="{int(w)}" height="{int(h)}" as="geometry"/>'
+            f'</mxCell>'
+        )
+
+    def emit_collapsed(cid, value, style, x, y, cw, ch, ew, eh, parent):
+        # A draw.io collapsed container: on-screen size is (cw, ch) (just the
+        # header); alternateBounds holds the expanded size (ew, eh) used when
+        # the user double-clicks to expand. Children are hidden until expanded.
+        cells.append(
+            f'<mxCell id="{cid}" value="{_xml_escape(value)}" style="{_xml_escape(style)}" '
+            f'vertex="1" parent="{parent}">'
+            f'<mxGeometry x="{int(x)}" y="{int(y)}" width="{int(cw)}" height="{int(ch)}" as="geometry">'
+            f'<mxRectangle width="{int(ew)}" height="{int(eh)}" as="alternateBounds"/>'
+            f'</mxGeometry></mxCell>'
+        )
+
+    icon_id_by_name = {}   # resource name (lower) → emitted icon cell id (for arrows)
+
+    def box_size_for_icons(n):
+        """Inner content size (w, h) for n icons packed SUB_COLS-wide."""
+        if n <= 0:
+            return CELL_W, 0
+        sizes = [(CELL_W, CELL_H)] * n
+        max_row_w = SUB_COLS * (CELL_W + G)
+        _, cw, ch = _shelf_pack(sizes, max_row_w, G)
+        return cw, ch
+
+    def emit_icons(items, parent_id):
+        shown = items[:MAX_ICONS_PER_BOX]
+        sizes = [(CELL_W, CELL_H)] * len(shown)
+        max_row_w = SUB_COLS * (CELL_W + G)
+        positions, _, _ = _shelf_pack(sizes, max_row_w, G)
+        off = (CELL_W - ICON_W) // 2   # center the 36px icon in its footprint cell
+        for (label, kind), (px, py) in zip(shown, positions):
+            iid = new_id("i")
+            emit(iid, label, S_ICON + f"image={icon.get(kind, icon['vm'])};",
+                 SUB_PAD + px + off, SUB_HEADER + py, ICON_W, ICON_H, parent_id)
+            key = str(label).strip().lower()
+            if key and key not in icon_id_by_name:
+                icon_id_by_name[key] = iid
+
+    # ---- group VNets by region, build subnet→resource membership ----
+    # VMs (and VMSS) placed into their subnet; everything else → inventory.
+    vnet_by_name = {}
+    for idx, v in enumerate(networks):
+        nm = str(v.get("name") or f"vnet-{idx+1}").strip()
+        vnet_by_name[nm.lower()] = {
+            "name": nm,
+            "region": (str(v.get("location") or "").strip() or "Unknown Region"),
+            "subscription": (str(v.get("subscription") or "").strip() or "Unknown subscription"),
+            "cidr": _clean_cidr(v.get("address_space")),
+            "subnets": {},  # subnet_lower -> {name, cidr, nsg, icons:[]}
+        }
+
+    def ensure_vnet(vlower, fallback_name=""):
+        if vlower not in vnet_by_name:
+            vnet_by_name[vlower] = {
+                "name": fallback_name or vlower or "unknown-vnet",
+                "region": "Unknown Region",
+                "subscription": "Unknown subscription",
+                "cidr": "",
+                "subnets": {},
+            }
+        return vnet_by_name[vlower]
+
+    def ensure_subnet(v, sname, cidr="", nsg=""):
+        sl = str(sname or "default").strip().lower() or "default"
+        if sl not in v["subnets"]:
+            v["subnets"][sl] = {"name": str(sname or "default").strip() or "default",
+                                "cidr": cidr, "nsg": nsg, "icons": []}
+        return v["subnets"][sl]
+
+    for s in subnets:
+        vl = str(s.get("vnet") or "").strip().lower()
+        if not vl:
+            continue
+        v = ensure_vnet(vl)
+        ensure_subnet(v, s.get("name"), _clean_cidr(s.get("address_prefix")), str(s.get("nsg") or ""))
+
+    # AKS node-pool VMs (names like aks-* and/or living in an MC_* node resource
+    # group) are managed infrastructure. They would otherwise swamp their subnet
+    # with dozens of identical nodes, so we divert them into a collapsed
+    # "AKS Nodes" box per cluster instead of placing them in the topology.
+    node_rg_to_cluster = {
+        str(a.get("node_resource_group") or "").strip().lower(): str(a.get("name") or "").strip()
+        for a in aks_clusters if str(a.get("node_resource_group") or "").strip()
+    }
+    aks_node_buckets = defaultdict(list)   # bucket label → [node names]
+
+    def _is_aks_node(r):
+        nm = str(r.get("name") or "").strip().lower()
+        rg = str(r.get("resource_group") or "").strip().lower()
+        return nm.startswith("aks-") or rg.startswith("mc_")
+
+    def place_compute(items, kind, collapse_aks_nodes=False):
+        for r in items:
+            if collapse_aks_nodes and _is_aks_node(r):
+                rg = str(r.get("resource_group") or "").strip().lower()
+                label = node_rg_to_cluster.get(rg) or (str(r.get("resource_group") or "").strip() or "AKS nodes")
+                aks_node_buckets[label].append(str(r.get("name") or "aks-node").strip())
+                continue
+            vl = str(r.get("vnet") or "").strip().lower()
+            if not vl:
+                continue
+            v = ensure_vnet(vl)
+            sub = ensure_subnet(v, r.get("subnet") or "default")
+            sub["icons"].append((str(r.get("name") or kind).strip(), kind))
+
+    place_compute(compute, "vm", collapse_aks_nodes=True)
+    place_compute(vm_scale_sets, "vmss", collapse_aks_nodes=True)
+
+    # Private endpoints carry their own vnet+subnet → place them in that subnet
+    # when known; the rest fall back to the PaaS inventory so none are lost.
+    unplaced_pe = []
+    for pe in private_endpoints:
+        vl = str(pe.get("vnet") or "").strip().lower()
+        if not vl or vl not in vnet_by_name:
+            unplaced_pe.append(pe)
+            continue
+        v = ensure_vnet(vl)
+        sub = ensure_subnet(v, pe.get("subnet") or "default")
+        sub["icons"].append((str(pe.get("name") or "private-endpoint").strip(), "pe"))
+
+    # AKS: infer the VNet/subnet it is integrated into from the NICs created in
+    # its node resource group (MC_*), so a VNet-integrated cluster shows inside
+    # its subnet rather than in the PaaS inventory.
+    nic_rg_vnet = defaultdict(Counter)
+    nic_rg_subnet = defaultdict(Counter)
+    for ni in network_interfaces:
+        rg = str(ni.get("resource_group") or "").strip().lower()
+        vn = str(ni.get("vnet") or "").strip()
+        sn = str(ni.get("subnet") or "").strip()
+        if rg and vn:
+            nic_rg_vnet[rg][vn] += 1
+        if rg and sn:
+            nic_rg_subnet[rg][sn] += 1
+
+    def _dominant(counter):
+        return counter.most_common(1)[0][0] if counter else ""
+
+    placed_aks = []   # AKS objects successfully placed in a subnet
+    for aks in aks_clusters:
+        nrg = str(aks.get("node_resource_group") or "").strip().lower()
+        rg = str(aks.get("resource_group") or "").strip().lower()
+        hint = str(aks.get("network_hint") or "").strip().lower()
+        vn = hint or _dominant(nic_rg_vnet.get(nrg)) or _dominant(nic_rg_vnet.get(rg))
+        sn = _dominant(nic_rg_subnet.get(nrg)) or _dominant(nic_rg_subnet.get(rg))
+        # Fallback: a subnet whose name signals AKS/Kubernetes.
+        if not vn:
+            for vl, vd in vnet_by_name.items():
+                for sl in vd["subnets"]:
+                    if "aks" in sl or "kubernet" in sl:
+                        vn, sn = vd["name"], vd["subnets"][sl]["name"]
+                        break
+                if vn:
+                    break
+        if vn:
+            v = ensure_vnet(vn.lower())
+            sub = ensure_subnet(v, sn or "aks-subnet")
+            sub["icons"].append((str(aks.get("name") or "aks").strip(), "aks"))
+            placed_aks.append(aks)
+
+    # ---- compute sizes bottom-up, emit Subscription → Region → VNet → Subnet ----
+    cursor_y = MARGIN
+    vnet_cell_id = {}     # vnet name (lower) → vnet cell id (peering edges)
+    subnet_cell_id = {}   # (vnet_lower, subnet_lower) → subnet cell id (flow edges)
+
+    S_SUBSCRIPTION = _CBASE + "fillColor=#FFFCF0;strokeColor=#D9A400;fontStyle=1;fontSize=15;"
+
+    def size_vnet(v):
+        sub_items = sorted(v["subnets"].values(), key=lambda d: d["name"].lower())
+        if not sub_items:
+            sub_items = [{"name": "(no subnets)", "cidr": "", "nsg": "", "icons": []}]
+        sub_sizes, sub_meta = [], []
+        for sub in sub_items:
+            cw, ch = box_size_for_icons(len(sub["icons"]))
+            sw = max(MIN_SUBNET_W, SUB_PAD * 2 + cw)
+            sh = SUB_HEADER + (SUB_PAD + ch + SUB_PAD if ch > 0 else SUB_PAD)
+            sub_sizes.append((sw, sh))
+            sub_meta.append(sub)
+        positions, cw, ch = _shelf_pack(sub_sizes, VNET_MAXW, G)
+        vnet_w = max(MIN_VNET_W, VNET_PAD * 2 + cw)
+        vnet_h = VNET_HEADER + VNET_PAD + ch + VNET_PAD
+        return vnet_w, vnet_h, list(zip(sub_meta, sub_sizes, positions))
+
+    def size_region(vnets):
+        renders = []
+        for v in sorted(vnets, key=lambda d: d["name"].lower()):
+            vw, vh, sl = size_vnet(v)
+            renders.append((v, vw, vh, sl))
+        positions, cw, ch = _shelf_pack([(vw, vh) for (_, vw, vh, _) in renders], REGION_MAXW, G)
+        region_w = max(MIN_VNET_W, REGION_PAD * 2 + cw)
+        region_h = REGION_HEADER + REGION_PAD + ch + REGION_PAD
+        return region_w, region_h, list(zip(renders, positions))
+
+    def emit_vnet(vdata, vw, vh, sub_layout, ox, oy, parent_id):
+        vlabel = vdata["name"] + (f"  {vdata['cidr']}" if vdata["cidr"] else "")
+        vnet_id = new_id("v")
+        vnet_cell_id[vdata["name"].lower()] = vnet_id
+        emit(vnet_id, vlabel, S_VNET, ox, oy, vw, vh, parent_id)
+        for sub, (sw, sh), (spx, spy) in sub_layout:
+            slabel = sub["name"] + (f"  {sub['cidr']}" if sub["cidr"] else "")
+            sid = new_id("s")
+            subnet_cell_id[(vdata["name"].lower(), sub["name"].lower())] = sid
+            emit(sid, slabel, S_SUBNET, VNET_PAD + spx, VNET_HEADER + spy, sw, sh, vnet_id)
+            emit_icons(sub["icons"], sid)
+
+    def emit_region(region_name, rw, rh, vnet_layout, ox, oy, parent_id):
+        rid = new_id("r")
+        emit(rid, region_name, S_REGION, ox, oy, rw, rh, parent_id)
+        for (vdata, vw, vh, sl), (vpx, vpy) in vnet_layout:
+            emit_vnet(vdata, vw, vh, sl, REGION_PAD + vpx, REGION_HEADER + vpy, rid)
+
+    # Group VNets: Subscription → Region → [VNets].
+    by_sub = defaultdict(lambda: defaultdict(list))
+    for v in vnet_by_name.values():
+        by_sub[v["subscription"]][v["region"]].append(v)
+
+    for sub_name in sorted(by_sub.keys()):
+        region_sizes, region_layouts = [], []
+        for region_name in sorted(by_sub[sub_name].keys()):
+            rw, rh, vl = size_region(by_sub[sub_name][region_name])
+            region_sizes.append((rw, rh))
+            region_layouts.append((region_name, rw, rh, vl))
+        # Stack regions vertically inside the subscription (one per row).
+        rpos, cw, ch = _shelf_pack(region_sizes, 1, REGION_GAP)
+        sub_w = max(MIN_VNET_W, REGION_PAD * 2 + cw)
+        sub_h = REGION_HEADER + REGION_PAD + ch + REGION_PAD
+        sub_id = new_id("sub")
+        emit(sub_id, f"SUBSCRIPTION · {sub_name}", S_SUBSCRIPTION, MARGIN, cursor_y, sub_w, sub_h, "1")
+        for (region_name, rw, rh, vl), (rx, ry) in zip(region_layouts, rpos):
+            emit_region(region_name, rw, rh, vl, REGION_PAD + rx, REGION_HEADER + ry, sub_id)
+        cursor_y += sub_h + REGION_GAP
+
+    # ---- inventory region for non-VNet-bound resources (PaaS / data / edge) ----
+    # Private endpoints and VNet-integrated AKS were already placed into their
+    # subnets above, so they are excluded here to avoid double-counting.
+    placed_aks_keys = {
+        f"{str(a.get('name') or '').strip().lower()}|{str(a.get('resource_group') or '').strip().lower()}"
+        for a in placed_aks
+    }
+    unplaced_aks = [
+        a for a in aks_clusters
+        if f"{str(a.get('name') or '').strip().lower()}|{str(a.get('resource_group') or '').strip().lower()}"
+        not in placed_aks_keys
+    ]
+    inv_groups = [
+        ("Web Apps / App Services", web_apps, "web"),
+        ("Databases", databases, "sql"),
+        ("Storage Accounts", storage_accounts, "storage"),
+        ("Private Endpoints", unplaced_pe, "pe"),
+        ("Load Balancers", load_balancers, "lb"),
+        ("Application Gateways", application_gateways, "appgw"),
+        ("AKS Clusters", unplaced_aks, "aks"),
+    ]
+    inv_present = [(t, items, k) for (t, items, k) in inv_groups if items]
+    if inv_present:
+        box_sizes = []
+        box_meta = []
+        for title, items, kind in inv_present:
+            icons = [(str(r.get("name") or title).strip(), kind) for r in items]
+            cw, ch = box_size_for_icons(len(icons))
+            bw = max(MIN_SUBNET_W, SUB_PAD * 2 + cw)
+            bh = SUB_HEADER + (SUB_PAD + ch + SUB_PAD if ch > 0 else SUB_PAD)
+            box_sizes.append((bw, bh))
+            box_meta.append((title, icons))
+        positions, content_w, content_h = _shelf_pack(box_sizes, REGION_MAXW, G)
+        region_w = max(MIN_VNET_W, REGION_PAD * 2 + content_w)
+        region_h = REGION_HEADER + REGION_PAD + content_h + REGION_PAD
+        region_id = new_id("r")
+        emit(region_id, "Managed Services & PaaS (inventory)", S_INV_REGION,
+             MARGIN, cursor_y, region_w, region_h, "1")
+        for (title, icons), (bw, bh), (bpx, bpy) in zip(box_meta, box_sizes, positions):
+            extra = f"  (+{len(icons) - MAX_ICONS_PER_BOX} more)" if len(icons) > MAX_ICONS_PER_BOX else ""
+            box_id = new_id("s")
+            emit(box_id, f"{title} ({len(icons)}){extra}", S_SUBNET,
+                 REGION_PAD + bpx, REGION_HEADER + bpy, bw, bh, region_id)
+            emit_icons(icons, box_id)
+        cursor_y += region_h + REGION_GAP
+
+    # ---- AKS node pools: one collapsed box per cluster (nodes hidden until expanded) ----
+    if aks_node_buckets:
+        NODE_COLS = SUB_COLS
+        boxes = []
+        for label in sorted(aks_node_buckets.keys()):
+            names = aks_node_buckets[label]
+            sizes = [(CELL_W, CELL_H)] * len(names)
+            positions, cw, ch = _shelf_pack(sizes, NODE_COLS * (CELL_W + G), G)
+            ew = max(MIN_SUBNET_W, SUB_PAD * 2 + cw)
+            eh = SUB_HEADER + SUB_PAD + ch + SUB_PAD
+            title = f"AKS Nodes: {label} ({len(names)})"
+            cw_collapsed = max(220, min(380, 9 * len(title)))
+            ch_collapsed = 30
+            boxes.append((title, names, positions, ew, eh, cw_collapsed, ch_collapsed))
+
+        csizes = [(b[5], b[6]) for b in boxes]
+        cpos, content_w, content_h = _shelf_pack(csizes, REGION_MAXW, G)
+        region_w = max(MIN_VNET_W, REGION_PAD * 2 + content_w)
+        region_h = REGION_HEADER + REGION_PAD + content_h + REGION_PAD
+        region_id = new_id("r")
+        emit(region_id, "AKS Node Pools  (collapsed — double-click a box to expand)",
+             S_AKS_REGION, MARGIN, cursor_y, region_w, region_h, "1")
+        for (title, names, positions, ew, eh, cwth, chth), (bx, by) in zip(boxes, cpos):
+            box_id = new_id("k")
+            emit_collapsed(box_id, title, S_AKS_BOX,
+                           REGION_PAD + bx, REGION_HEADER + by, cwth, chth, ew, eh, region_id)
+            off = (CELL_W - ICON_W) // 2
+            for nm, (px, py) in zip(names, positions):
+                emit(new_id("i"), nm, S_ICON + f"image={icon['vm']};",
+                     SUB_PAD + px + off, SUB_HEADER + py, ICON_W, ICON_H, box_id)
+        cursor_y += region_h + REGION_GAP
+
+    # ---- edges: VNet peering + resource-to-resource connections ----
+    if arrows:
+        import ast as _ast, re as _re
+
+        def _edge(src, tgt, style, label=""):
+            eid = new_id("e")
+            lbl = f' value="{_xml_escape(label)}"' if label else ' value=""'
+            cells.append(
+                f'<mxCell id="{eid}"{lbl} style="{_xml_escape(style)}" edge="1" parent="1" '
+                f'source="{src}" target="{tgt}">'
+                f'<mxGeometry relative="1" as="geometry"/></mxCell>'
+            )
+
+        def _as_list(raw):
+            if isinstance(raw, list):
+                return raw
+            if isinstance(raw, str) and raw.strip().startswith("["):
+                try:
+                    return _ast.literal_eval(raw)
+                except Exception:
+                    return []
+            return []
+
+        # NIC name → owning VM name, parsed from each VM's network_interfaces blob.
+        # Lets us resolve load-balancer backends that reference NICs, not VMs.
+        nic_to_vm = {}
+        for v in compute:
+            owner = str(v.get("name") or "").strip()
+            for nicname in _re.findall(r"networkinterfaces/([^/'\"\]}]+)", str(v.get("network_interfaces") or ""), _re.I):
+                nic_to_vm[nicname.strip().lower()] = owner
+
+        def _resolve_icon(name):
+            k = str(name or "").strip().lower()
+            if not k:
+                return None
+            if k in icon_id_by_name:
+                return icon_id_by_name[k]
+            # strip common NIC/interface suffixes (e.g. "vm1-eth2", "vm_nic0")
+            k2 = _re.sub(r"[-_](eth\d+|nic\d*|ipconfig\d*|primary|internal|external)$", "", k)
+            if k2 in icon_id_by_name:
+                return icon_id_by_name[k2]
+            # NIC → owning VM
+            vm = nic_to_vm.get(k) or nic_to_vm.get(k2)
+            if vm and vm.strip().lower() in icon_id_by_name:
+                return icon_id_by_name[vm.strip().lower()]
+            return None
+
+        # 1) VNet peering (dashed orange, no arrowhead) — matches the template.
+        seen_pairs = set()
+        for v in networks:
+            a = str(v.get("name") or "").strip().lower()
+            if a not in vnet_cell_id:
+                continue
+            for p in _as_list(v.get("peerings")):
+                if not isinstance(p, dict):
+                    continue
+                props = p.get("properties") or {}
+                rvn = (props.get("remoteVirtualNetwork") or {}) if isinstance(props, dict) else {}
+                rid = str(rvn.get("id") or "")
+                if "/virtualnetworks/" not in rid.lower():
+                    continue
+                b = rid.rstrip("/").split("/")[-1].strip().lower()
+                if b not in vnet_cell_id or b == a:
+                    continue
+                pair = tuple(sorted((a, b)))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                _edge(vnet_cell_id[a], vnet_cell_id[b], E_PEER)
+
+        # 2) Resource connections (solid green arrows), capped to stay readable.
+        seen_conn = set()
+        conn_count = 0
+        CONN_CAP = 500
+
+        def _conn(src, tgt):
+            nonlocal conn_count
+            if not src or not tgt or src == tgt or conn_count >= CONN_CAP:
+                return
+            key = (src, tgt)
+            if key in seen_conn:
+                return
+            seen_conn.add(key)
+            _edge(src, tgt, E_CONN)
+            conn_count += 1
+
+        # Load balancer → backend members
+        for lb in load_balancers:
+            sid = icon_id_by_name.get(str(lb.get("name") or "").strip().lower())
+            if not sid:
+                continue
+            for t in _as_list(lb.get("backend_targets")):
+                _conn(sid, _resolve_icon(t))
+
+        # Private endpoint → linked target resource
+        for pe in private_endpoints:
+            sid = icon_id_by_name.get(str(pe.get("name") or "").strip().lower())
+            if not sid:
+                continue
+            blob = str(pe.get("linked_resource") or pe.get("linked_resources") or "")
+            targets = _re.findall(r"/providers/[^/]+/[^/]+/([^/'\"\]}]+)", blob)
+            for nm in targets[:1]:
+                _conn(sid, _resolve_icon(nm))
+
+        # AKS internal load balancers → their AKS cluster(s).
+        aks_icon_ids = [icon_id_by_name[k] for k in (
+            str(a.get("name") or "").strip().lower() for a in aks_clusters
+        ) if k in icon_id_by_name]
+        for lb in load_balancers:
+            if "kubernetes" in str(lb.get("name") or "").lower():
+                sid = icon_id_by_name.get(str(lb.get("name") or "").strip().lower())
+                for aid in aks_icon_ids:
+                    _conn(sid, aid)
+
+        # 3) Logical flow arrows (blue) inferred from subnet tiers:
+        #    edge/public → web/app → app → db, within each VNet. These are
+        #    inferred from naming (not verified dependencies) but convey flow.
+        E_FLOW = ("edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;"
+                  "strokeColor=#2E75B6;strokeWidth=1.3;")
+
+        def _tier(sname):
+            s = str(sname).lower()
+            if any(k in s for k in ("db", "data", "sql", "postgre", "mysql", "mongo", "cache", "redis")):
+                return "db"
+            if any(k in s for k in ("appgw", "gateway", "waf", "ngfw", "firewall", "dmz",
+                                    "perimeter", "public", "frontend", "edge", "bastion")):
+                return "edge"
+            if "web" in s:
+                return "web"
+            if any(k in s for k in ("app", "api", "aks", "kubernet", "compute", "svc", "service", "mid")):
+                return "app"
+            return ""
+
+        flow = [0]
+        FLOW_CAP = 400
+
+        def _flow(a_list, b_list):
+            for a in a_list:
+                for b in b_list:
+                    if a != b and flow[0] < FLOW_CAP:
+                        _edge(a, b, E_FLOW)
+                        flow[0] += 1
+
+        for vl in vnet_by_name.keys():
+            tiers = {"edge": [], "web": [], "app": [], "db": []}
+            for (vv, sl), sid in subnet_cell_id.items():
+                if vv == vl:
+                    t = _tier(sl)
+                    if t:
+                        tiers[t].append(sid)
+            _flow(tiers["edge"], tiers["web"] or tiers["app"])
+            _flow(tiers["web"], tiers["app"])
+            _flow(tiers["app"], tiers["db"])
+
+    body = "".join(cells)
+    total_w = 2000
+    total_h = cursor_y + MARGIN
+    return (
+        '<mxfile host="app.diagrams.net">'
+        '<diagram name="Azure Architecture" id="azure-arch">'
+        f'<mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" '
+        f'tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" '
+        f'pageWidth="{total_w}" pageHeight="{int(total_h)}" math="0" shadow="0">'
+        '<root><mxCell id="0"/><mxCell id="1" parent="0"/>'
+        f'{body}</root></mxGraphModel></diagram></mxfile>'
+    )
+
+
+def _azure_icon_map():
+    """Shared Azure icon URI map (resolved from local Azure-Icons/)."""
+    AZ = "https://www.azureicons.com/static/images/icons"
+    return {
+        "vm": get_icon_uri("Compute", "Virtual-Machine", f"{AZ}/Compute/svg/Virtual-Machine.svg"),
+        "vmss": get_icon_uri("Compute", "VM-Scale-Sets", f"{AZ}/Compute/svg/VM-Scale-Sets.svg"),
+        "aks": get_icon_uri("Containers", "Kubernetes-Services", f"{AZ}/Containers/svg/Kubernetes-Services.svg"),
+        "lb": get_icon_uri("Networking", "Load-Balancers", f"{AZ}/Networking/svg/Load-Balancers.svg"),
+        "appgw": get_icon_uri("Networking", "Application-Gateways", f"{AZ}/Networking/svg/Application-Gateways.svg"),
+        "pe": get_icon_uri("Networking", "Private-Link", f"{AZ}/Networking/svg/Private-Link.svg"),
+        "sql": get_icon_uri("Databases", "Azure-SQL", f"{AZ}/Databases/svg/Azure-SQL.svg"),
+        "storage": get_icon_uri("Storage", "Storage-Accounts", f"{AZ}/Storage/svg/Storage-Accounts.svg"),
+        "web": get_icon_uri("App-Services", "App-Services", f"{AZ}/App%20Services/svg/App-Services.svg"),
+        "vnet": get_icon_uri("Networking", "Virtual-Networks", f"{AZ}/Networking/svg/Virtual-Networks.svg"),
+    }
+
+
+def _build_azure_drawio_rgwise(summary: Dict) -> str:
+    """Resource-group-oriented draw.io layout for Azure.
+
+    Groups every resource under its Resource Group. Each RG is an auto-sized
+    container holding all of its resources as icons, packed in a grid so
+    nothing overlaps. RG boxes are themselves packed into rows.
+    """
+    ICON_W, ICON_H = 60, 74
+    G = 14
+    PAD, HEADER = 12, 42
+    RG_ICON_COLS = 10            # icons per row inside an RG box
+    MIN_RG_W = 200
+    GRID_MAXW = 3600             # wrap RG boxes past this width
+    MARGIN, RG_GAP = 40, 40
+
+    icon = _azure_icon_map()
+    S_RG = "rounded=1;arcSize=3;whiteSpace=wrap;html=1;verticalAlign=top;fontStyle=1;fontSize=13;fillColor=#eef2f7;strokeColor=#6c8ebf;strokeWidth=1;spacingTop=4;"
+    S_ICON = (
+        "shape=image;verticalLabelPosition=bottom;verticalAlign=top;align=center;"
+        "imageAspect=0;aspect=fixed;whiteSpace=wrap;html=1;labelBackgroundColor=none;"
+        "fontSize=8;strokeColor=none;fillColor=none;"
+    )
+
+    buckets = defaultdict(list)   # rg name -> [(label, kind)]
+
+    def add(items, kind):
+        for r in items:
+            if not isinstance(r, dict):
+                continue
+            rg = str(r.get("resource_group") or "").strip() or "(no resource group)"
+            buckets[rg].append((str(r.get("name") or kind).strip(), kind))
+
+    add(summary.get("compute", []) or [], "vm")
+    add(summary.get("vm_scale_sets", []) or [], "vmss")
+    add(summary.get("aks_clusters", []) or [], "aks")
+    add(summary.get("web_apps", []) or [], "web")
+    add(summary.get("database_services", []) or [], "sql")
+    add(summary.get("storage_accounts", []) or [], "storage")
+    add(summary.get("private_endpoints", []) or [], "pe")
+    add(summary.get("load_balancers", []) or [], "lb")
+    add(summary.get("application_gateways", []) or [], "appgw")
+
+    cells = []
+    _cid = {"n": 0}
+
+    def new_id(prefix="c"):
+        _cid["n"] += 1
+        return f"{prefix}{_cid['n']}"
+
+    def emit(cid, value, style, x, y, w, h, parent, edge=False):
+        cells.append(
+            f'<mxCell id="{cid}" value="{_xml_escape(value)}" style="{_xml_escape(style)}" '
+            f'vertex="1" parent="{parent}">'
+            f'<mxGeometry x="{int(x)}" y="{int(y)}" width="{int(w)}" height="{int(h)}" as="geometry"/>'
+            f'</mxCell>'
+        )
+
+    max_row_w = RG_ICON_COLS * (ICON_W + G)
+    rg_render = []  # (rg_name, icons, rg_w, rg_h, positions)
+    for rg_name in sorted(buckets.keys()):
+        icons = buckets[rg_name]
+        sizes = [(ICON_W, ICON_H)] * len(icons)
+        positions, cw, ch = _shelf_pack(sizes, max_row_w, G)
+        rg_w = max(MIN_RG_W, PAD * 2 + (cw if icons else ICON_W))
+        rg_h = HEADER + PAD + (ch if icons else 0) + PAD
+        rg_render.append((rg_name, icons, rg_w, rg_h, positions))
+
+    rg_sizes = [(w, h) for (_, _, w, h, _) in rg_render]
+    rg_positions, _, _ = _shelf_pack(rg_sizes, GRID_MAXW, RG_GAP)
+
+    for (rg_name, icons, rg_w, rg_h, positions), (rx, ry) in zip(rg_render, rg_positions):
+        rg_id = new_id("g")
+        emit(rg_id, f"{rg_name} ({len(icons)})", S_RG, MARGIN + rx, MARGIN + ry, rg_w, rg_h, "1")
+        for (label, kind), (px, py) in zip(icons, positions):
+            emit(new_id("i"), label, S_ICON + f"image={icon.get(kind, icon['vm'])};",
+                 PAD + px, HEADER + py, ICON_W, ICON_H, rg_id)
+
+    total_h = MARGIN + (max((ry + h) for (_, _, _, h, _), (_, ry) in zip(rg_render, rg_positions)) if rg_render else 0) + MARGIN
+    body = "".join(cells)
+    return (
+        '<mxfile host="app.diagrams.net">'
+        '<diagram name="Azure by Resource Group" id="azure-rg">'
+        f'<mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" '
+        f'tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" '
+        f'pageWidth="2000" pageHeight="{int(total_h)}" math="0" shadow="0">'
+        '<root><mxCell id="0"/><mxCell id="1" parent="0"/>'
+        f'{body}</root></mxGraphModel></diagram></mxfile>'
+    )
+
+
 def _build_drawio_network_xml(summary: Dict) -> str:
     """
     Build native draw.io XML for a clean network architecture layout.
-    Dispatches by cloud — Azure uses Azure-Icons SVGs, AWS uses drawio's
-    built-in AWS4 stencil library (no external files needed).
+    Dispatches by cloud — Azure uses the deterministic nested layout
+    (Region → VNet → Subnet → resources), AWS uses drawio's built-in AWS4
+    stencil library (no external files needed).
     """
     cloud = str(summary.get("cloud") or "").lower()
     if cloud == "aws":
         return _build_aws_drawio_network_xml(summary)
     if cloud != "azure":
         return ""
+
+    # Azure uses the deterministic nested auto-sizing layout.
+    return _build_azure_drawio_nested(summary)
 
     networks = summary.get("networks", []) or []
     subnets = summary.get("subnets", []) or []

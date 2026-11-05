@@ -662,9 +662,8 @@ export default function AssessmentPage() {
                                                 onChange={(e) => setDiagramType(e.target.value)}
                                                 className="bg-gray-700 border border-gray-600 rounded-lg text-white text-sm px-2 py-2 flex-1 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                                             >
-                                                <option value="network">Network Topology</option>
-                                                <option value="resource_groups">Resource Groups</option>
-                                                <option value="migration">Migration Readiness</option>
+                                                <option value="network">Complete Architecture (with peering)</option>
+                                                <option value="resource_groups">Resource Group wise</option>
                                             </select>
                                             
                                             <button
@@ -704,9 +703,8 @@ export default function AssessmentPage() {
                                     </svg>
                                 </div>
                                 <h2 className="text-2xl font-bold text-white">
-                                    {diagramType === 'network' ? 'Network Topology' :
-                                     diagramType === 'resource_groups' ? 'Resource Groups Overview' :
-                                     'Migration Readiness'}
+                                    {diagramType === 'resource_groups' ? 'Resource Group wise' :
+                                     'Complete Architecture'}
                                 </h2>
                             </div>
                         </div>
