@@ -270,6 +270,10 @@ class ResourceTypeFriendlyNames:
     """Override friendly names for specific resource types"""
     
     OVERRIDES: Dict[str, str] = {
+        "microsoft.cdn/profiles/origingroups/origins": "Front Door Origins",
+        "microsoft.cdn/profiles/customdomains": "Front Door Custom Domains",
+        "microsoft.cdn/profiles/afdendpoints/routes": "Front Door Routes",
+        "microsoft.insights/datacollectionruleassociations": "Data Collection Rule Associations",
         "microsoft.dbformysql/flexibleservers": "MySQL Flexible Servers",
         "microsoft.dbforpostgresql/flexibleservers": "PostgreSQL Flexible Servers",
         "microsoft.insights/metricalerts": "Metric Alerts",

@@ -24,6 +24,7 @@ import ast
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import AzureOpenAIConfig
+import azure_landing_zone
 
 # ---------------------------------------------------------------------------
 # Local Azure icon resolver
@@ -1770,9 +1771,13 @@ def generate_architecture_diagram(
     file_path: str,
     diagram_type: str = "network",
     cloud_type: str = None,
+    source_name: str = None,
 ) -> dict:
     """
     Main entry point: Extract data from Excel → build native draw.io XML.
+
+    source_name: workbook name shown in the diagram title (defaults to the file name; uploads pass the
+    original name because file_path is a temp file).
 
     draw.io is the ONLY supported output. Mermaid generation has been removed.
 
@@ -1800,8 +1805,12 @@ def generate_architecture_diagram(
             print("🧭 Building draw.io resource-group view...")
             drawio_xml = _build_azure_drawio_rgwise(summary)
         elif cloud == "azure":
-            print("🧭 Building complete draw.io architecture (with peering arrows)...")
-            drawio_xml = _build_azure_drawio_nested(summary, arrows=True)
+            print("🧭 Building complete draw.io architecture (landing-zone layout)...")
+            try:
+                drawio_xml = azure_landing_zone.build_landing_zone_drawio(file_path, source_name)
+            except Exception as e:
+                print(f"⚠️ landing-zone builder failed ({e}); falling back to the nested layout")
+                drawio_xml = _build_azure_drawio_nested(summary, arrows=True)
         else:
             print("🧭 Building draw.io network topology diagram...")
             drawio_xml = _build_drawio_network_xml(summary)

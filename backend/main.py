@@ -291,7 +291,8 @@ async def generate_architecture_upload_endpoint(
         result = architecture_generator.generate_architecture_diagram(
             file_path=temp_file_path,
             diagram_type=diagram_type,
-            cloud_type=cloud_type
+            cloud_type=cloud_type,
+            source_name=os.path.splitext(os.path.basename(file.filename))[0],
         )
         return {
             "status": "success",

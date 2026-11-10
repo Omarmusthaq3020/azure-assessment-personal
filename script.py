@@ -247,6 +247,154 @@ def query_azure_resource_graph(env=None, subscription_ids=None):
     print(f"✅ Total resources fetched: {len(all_resources)}")
     return all_resources
 
+
+def _az_rest_list(path, env=None):
+    """GET an ARM collection with `az rest`, following nextLink. Returns [] on any failure."""
+    items, url = [], f"https://management.azure.com{path}"
+    while url:
+        try:
+            result = subprocess.run(['az', 'rest', '--method', 'get', '--url', url, '--output', 'json'],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, env=env)
+        except subprocess.CalledProcessError as e:
+            print(f"   ⚠️ az rest failed for {path}: {(e.stderr or '').strip()[:200]}")
+            return items
+        body = json.loads(result.stdout or '{}')
+        items.extend(body.get('value', []))
+        url = body.get('nextLink')
+    return items
+
+
+def _child_resource(item, rtype, parent, props):
+    """Shape a child resource returned by the Front Door API like a Resource Graph row."""
+    return {'id': item.get('id'), 'name': item.get('name'), 'type': rtype, 'location': 'global',
+            'resourceGroup': parent.get('resourceGroup'), 'subscriptionId': parent.get('subscriptionId'),
+            'tags': {}, 'properties': props}
+
+
+def fetch_frontdoor_origins(resources, env=None):
+    """Front Door (Standard/Premium) origins, custom domains and routes are not in Resource Graph's Resources
+    table, so fetch them per profile from the Front Door API. They come back as resources of type
+    microsoft.cdn/profiles/origingroups/origins, .../customdomains and .../afdendpoints/routes (sheets 'Front Door
+    Origins', 'Front Door Custom Domains', 'Front Door Routes') so the architecture diagram can draw
+    domain -> Front Door -> origin backend. clean_columns drops nested '.id' columns, so every link to a parent or
+    sibling is lifted into a plain name field (profileName, originGroup, endpointName, customDomainNames...)."""
+    api = 'api-version=2024-02-01'
+    out = []
+    endpoints = defaultdict(list)                       # profile id (lower) -> afdendpoint resources
+    for res in resources:
+        if (res.get('type') or '').lower() == 'microsoft.cdn/profiles/afdendpoints':
+            endpoints[res['id'].lower().split('/afdendpoints/')[0]].append(res)
+    n = Counter()
+    for res in resources:
+        if (res.get('type') or '').lower() != 'microsoft.cdn/profiles':
+            continue
+        if 'frontdoor' not in str((res.get('sku') or {}).get('name', '')).lower():
+            continue                      # classic CDN profiles have no origin groups at this level
+        profile = res.get('name')
+        for group in _az_rest_list(f"{res['id']}/originGroups?{api}", env):
+            for o in _az_rest_list(f"{group['id']}/origins?{api}", env):
+                props = dict(o.get('properties') or {})
+                link = ((props.get('sharedPrivateLinkResource') or {}).get('privateLink') or {}).get('id')
+                if link:
+                    props['privateLinkResourceId'] = link
+                props['originGroup'] = group.get('name')
+                props['profileName'] = profile
+                out.append(_child_resource(o, 'microsoft.cdn/profiles/origingroups/origins', res, props))
+                n['origins'] += 1
+        for cd in _az_rest_list(f"{res['id']}/customDomains?{api}", env):
+            props = dict(cd.get('properties') or {})
+            props['profileName'] = profile
+            zone = (props.get('azureDnsZone') or {}).get('id')
+            if zone:
+                props['azureDnsZoneName'] = zone.split('/')[-1]
+            out.append(_child_resource(cd, 'microsoft.cdn/profiles/customdomains', res, props))
+            n['custom domains'] += 1
+        for ep in endpoints.get(res['id'].lower(), []):
+            for rt in _az_rest_list(f"{ep['id']}/routes?{api}", env):
+                props = dict(rt.get('properties') or {})
+                props['profileName'] = profile
+                props['endpointName'] = ep.get('name')
+                props['originGroupName'] = ((props.get('originGroup') or {}).get('id') or '').split('/')[-1]
+                props['customDomainNames'] = ', '.join((c.get('id') or '').split('/')[-1] for c in props.get('customDomains') or [])
+                props['patternsToMatch'] = ', '.join(props.get('patternsToMatch') or [])
+                out.append(_child_resource(rt, 'microsoft.cdn/profiles/afdendpoints/routes', res, props))
+                n['routes'] += 1
+    if out:
+        print('🚪 Front Door details fetched: ' + ', '.join(f'{v} {k}' for k, v in n.items()))
+    return out
+
+def lift_link_names(resources):
+    """clean_columns drops nested '.id' columns, which loses the links the architecture diagram needs. Copy the
+    linked resource names into plain properties: a connection's gateway / on-prem site / ExpressRoute circuit, and a
+    compact one-line-per-route summary of each route table (the full JSON can exceed Excel's 32,767-char cell)."""
+    def leaf(ref):
+        return ((ref or {}).get('id') or '').split('/')[-1] or None
+
+    for res in resources:
+        rtype = (res.get('type') or '').lower()
+        props = res.get('properties')
+        if not isinstance(props, dict):
+            continue
+        if rtype == 'microsoft.network/connections':
+            for key in ('virtualNetworkGateway1', 'virtualNetworkGateway2', 'localNetworkGateway2', 'peer'):
+                name = leaf(props.get(key))
+                if name:
+                    props[f'{key}Name'] = name
+        elif rtype == 'microsoft.network/privatednszones/virtualnetworklinks':
+            # zone = parent in the link's id; VNet = the link's target
+            rid = res.get('id') or ''
+            if '/privatednszones/' in rid.lower():
+                props['privateDnsZoneName'] = rid[rid.lower().index('/privatednszones/') + len('/privatednszones/'):].split('/')[0]
+            name = leaf(props.get('virtualNetwork'))
+            if name:
+                props['virtualNetworkName'] = name
+        elif rtype == 'microsoft.network/routetables':
+            props['routesSummary'] = '; '.join(
+                f"{r.get('name')}: {(r.get('properties') or {}).get('addressPrefix')} -> "
+                f"{(r.get('properties') or {}).get('nextHopType')}"
+                + (f" {(r.get('properties') or {}).get('nextHopIpAddress')}" if (r.get('properties') or {}).get('nextHopIpAddress') else '')
+                for r in props.get('routes') or [])
+
+
+def fetch_dcr_associations(env=None, subscription_ids=None):
+    """Data collection rule associations (which VM / resource each DCR covers) live in Resource Graph's
+    insightsresources table, not Resources. Returned as resources of type
+    microsoft.insights/datacollectionruleassociations ('Data Collection Rule Associations' sheet)."""
+    query = ("insightsresources | where type =~ 'microsoft.insights/datacollectionruleassociations' "
+             "| project id, name, subscriptionId, resourceGroup, rule = tostring(properties.dataCollectionRuleId), "
+             "endpoint = tostring(properties.dataCollectionEndpointId)")
+    out, skip_token = [], None
+    try:
+        while True:
+            cmd = ['az', 'graph', 'query', '-q', query, '--first', str(AzureResourceGraphConfig.BATCH_SIZE), '--output', 'json']
+            if subscription_ids:
+                cmd.extend(['--subscriptions'] + list(subscription_ids))
+            if skip_token:
+                cmd.extend(['--skip-token', skip_token])
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, env=env)
+            body = json.loads(result.stdout)
+            for a in body.get('data', []):
+                target = (a.get('id') or '').split('/providers/Microsoft.Insights/dataCollectionRuleAssociations/')[0]
+                parts = target.split('/providers/')[-1].split('/') if '/providers/' in target else []
+                out.append({
+                    'id': a.get('id'), 'name': a.get('name'), 'type': 'microsoft.insights/datacollectionruleassociations',
+                    'location': 'global', 'resourceGroup': a.get('resourceGroup'), 'subscriptionId': a.get('subscriptionId'),
+                    'tags': {}, 'properties': {
+                        'dataCollectionRuleName': (a.get('rule') or '').split('/')[-1] or None,
+                        'dataCollectionEndpointName': (a.get('endpoint') or '').split('/')[-1] or None,
+                        'associatedResourceName': target.split('/')[-1] or None,
+                        'associatedResourceType': '/'.join(parts[:2]) if len(parts) >= 2 else None,
+                    }})
+            skip_token = body.get('skip_token')
+            if not skip_token:
+                break
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        print(f"   ⚠️ DCR association query failed: {getattr(e, 'stderr', e)}")
+    if out:
+        print(f"📈 DCR associations fetched: {len(out)}")
+    return out
+
+
 def get_subscription_map(env=None):
     try:
         result = subprocess.run([
@@ -1625,6 +1773,9 @@ def run_assessment(subscription_ids=None, env=None):
     # For now, let's filter the results based on the sub_map we just filtered.
     target_sub_ids = list(sub_map.keys()) if subscription_ids else None
     raw_resources = query_azure_resource_graph(env=env, subscription_ids=target_sub_ids)
+    raw_resources += fetch_frontdoor_origins(raw_resources, env=env)
+    raw_resources += fetch_dcr_associations(env=env, subscription_ids=target_sub_ids)
+    lift_link_names(raw_resources)
     print(f"🔍 Raw resources fetched: {len(raw_resources)}")
 
     # Diagnostic: per-type counts BEFORE filtering
