@@ -69,6 +69,11 @@ class _Book:
         self._cache = {}
 
     def sheet(self, name):
+        if name not in self._cache and name not in self.names:
+            # newer exports split types that share a friendly name: 'Connections' -> 'Connections (network)', ...
+            variants = [n for n in self.names if n.startswith(f'{name} (')]
+            if variants:
+                self._cache[name] = [r for v in variants for r in self.sheet(v)]
         if name not in self._cache:
             rows = []
             if name in self.names:
@@ -223,7 +228,6 @@ STRIP = collections.OrderedDict([
     ('Load Balancers', ('Load balancers', 'networking/Load_Balancers')),
     ('Trafficmanagerprofiles', ('Traffic Manager', 'networking/Traffic_Manager_Profiles')),
     ('Workspaces', ('Log Analytics workspaces', 'analytics/Log_Analytics_Workspaces')),
-    ('Application Insights', ('Application Insights', 'devops/Application_Insights')),
     ('Public IP Addresses', ('Public IPs', 'networking/Public_IP_Addresses')),
     ('Private Dns Zones', ('Private DNS zones', 'networking/DNS_Zones')),
     ('User Assigned Identities', ('Managed identities', 'identity/Managed_Identities')),
@@ -328,7 +332,10 @@ ARM_HANDLED = {'microsoft.cdn/profiles', 'microsoft.cdn/profiles/afdendpoints', 
                'microsoft.cdn/profiles/customdomains', 'microsoft.cdn/profiles/afdendpoints/routes',
                'microsoft.cdn/profiles/endpoints', 'microsoft.network/routetables', 'microsoft.network/connections',
                'microsoft.network/localnetworkgateways', 'microsoft.network/expressroutecircuits',
-               'microsoft.insights/datacollectionrules', 'microsoft.insights/datacollectionruleassociations'}
+               'microsoft.insights/datacollectionrules', 'microsoft.insights/datacollectionruleassociations',
+               'microsoft.insights/diagnosticsettings', 'microsoft.authorization/policyassignments', 'microsoft.authorization/locks',
+               'microsoft.security/pricings', 'microsoft.recoveryservices/vaults/backupfabrics/protectioncontainers/protecteditems',
+               'microsoft.insights/components'}
 
 
 def _arm_label(arm):
@@ -509,6 +516,8 @@ class _Inventory:
         self._links()
         self._frontdoor()
         self._hybrid()
+        self.markers_lock = {}
+        self._governance()
         self._strip()
 
     # subscriptions: id -> display name, from any row that carries both
@@ -527,6 +536,11 @@ class _Inventory:
                 ids = SUB_ID_RE.findall(r.text)
                 if name and ids:
                     self.sub_name.setdefault(ids[0].lower(), str(name))
+        for r in self.b.sheet('Subscriptions'):          # every assessed subscription, including empty ones
+            sid = str(r.g('Subscription Id') or '').lower()
+            if re.fullmatch(r'[0-9a-f-]{36}', sid):
+                self.sub_name[sid] = str(r.g('Subscription Name') or self.sub_name.get(sid) or f'Subscription {sid[:8]}')
+                all_ids.setdefault(sid, 0)
         for sid in all_ids:
             self.sub_name.setdefault(sid, f'Subscription {sid[:8]}')
         self.name_to_id = {v: k for k, v in self.sub_name.items()}
@@ -572,7 +586,9 @@ class _Inventory:
     def rows_of_type(self, arm_type):
         """Rows of the per-type sheet(s) holding resources of an ARM type (sheet names vary by export)."""
         arm_type = arm_type.lower()
-        sheets = {str(r.g('Type')) for r in self.b.sheet('AllResources') if str(r.g('Resource Type') or '').lower() == arm_type}
+        # newer exports record the exact sheet of every resource; older ones only the friendly type name
+        sheets = {str(r.g('Sheet') or r.g('Type')) for r in self.b.sheet('AllResources')
+                  if str(r.g('Resource Type') or '').lower() == arm_type}
         names = {str(r['Name']).lower() for r in self.b.sheet('AllResources') if str(r.g('Resource Type') or '').lower() == arm_type}
         # Excel caps sheet names at 31 characters ('Data Collection Rule Associations' -> '...Associatio')
         sheets = {sh if sh in self.b.names else sh[:31] for sh in sheets}
@@ -732,7 +748,8 @@ class _Inventory:
             for s in _subnets_of(r)[:1]:
                 ic = 'compute/Function_Apps' if 'func' in r['Name'].lower() else 'containers/App_Services'
                 self.put(*s, f"{r['Name']}<br>(VNet integration)", ic, 'App Service', r['Name'])
-        n_apps, n_jobs = len(b.sheet('Container Apps')), len(b.sheet('Jobs'))
+        n_apps = len(self.rows_of_type('microsoft.app/containerapps') or b.sheet('Container Apps'))
+        n_jobs = len(self.rows_of_type('microsoft.app/jobs') or b.sheet('Jobs'))
         for r in b.sheet('Managed Environments'):
             for s in _subnets_of(r)[:1]:
                 self.put(*s, f"{r['Name']}<br>(Container Apps env: {n_apps} apps, {n_jobs} jobs)",
@@ -906,12 +923,43 @@ class _Inventory:
             if zone and vnet:
                 self.vnet_dns[str(vnet).lower()].append((str(zone), str(r.g('Registration Enabled')).lower() == 'true'))
 
+    # governance: Defender plans, policy assignments, resource locks, backup-protected items
+    def _governance(self):
+        self.gov = collections.defaultdict(lambda: dict(defender=[], policy=[], locks=[], backup=[]))
+        self.backed_up = set()
+        for r in self.rows_of_type('microsoft.security/pricings'):
+            self.gov[self.sub_of_row(r)]['defender'].append((r['Name'], str(r.g('Pricing Tier') or '')))
+        for r in self.rows_of_type('microsoft.authorization/policyassignments'):
+            self.gov[self.sub_of_row(r)]['policy'].append(dict(
+                name=str(r.g('Display Name') or r['Name']), mode=str(r.g('Enforcement Mode') or ''),
+                noncompliant=int(float(r.g('Non Compliant Resources') or 0)), evaluated=int(float(r.g('Evaluated Resources') or 0))))
+        for r in self.rows_of_type('microsoft.authorization/locks'):
+            target = str(r.g('Locked Resource Name') or '')
+            self.gov[self.sub_of_row(r)]['locks'].append(dict(level=str(r.g('Level') or ''), target=target,
+                                                              ttype=str(r.g('Locked Resource Type') or '')))
+            if target and '/' in str(r.g('Locked Resource Type') or ''):
+                self.markers_lock.setdefault(target.lower(), str(r.g('Level') or 'lock'))
+        for r in self.rows_of_type('microsoft.recoveryservices/vaults/backupfabrics/protectioncontainers/protecteditems'):
+            name = str(r.g('Protected Resource Name') or r['Name'])
+            status = str(r.g('Last Backup Status') or '')
+            self.gov[self.sub_of_row(r)]['backup'].append(dict(name=name, status=status, state=str(r.g('Protection State') or ''),
+                                                               vault=str(r.g('Vault Name') or ''), when=str(r.g('Last Backup Time') or '')))
+            self.backed_up.add(name.lower())
+            self.markers[('Virtual Machines', name.lower())].append(
+                (_icon('other/Backup_Vault'), f"Backed up to {r.g('Vault Name') or 'vault'} - last backup {status or 'n/a'}"
+                                              f"{' at ' + str(r.g('Last Backup Time')) if r.g('Last Backup Time') else ''}"))
+        self.has_backup_data = bool(self.rows_of_type('microsoft.recoveryservices/vaults/backupfabrics/protectioncontainers/protecteditems')) \
+            or any('Backup Protected Items' in n for n in self.b.names)
+        for target, level in self.markers_lock.items():
+            for kind in ('Virtual Machines', 'Load Balancers', 'Application Gateways', 'Virtual Network Gateways', 'Firewalls'):
+                self.markers[(kind, target)].append((_icon('management_governance/Customer_Lockbox_for_MS_Azure'), f'Resource lock: {level}'))
+
     # what each Log Analytics workspace receives from, and what each user-assigned identity is assigned to
     def _links(self):
         b = self.b
-        skip = {'AllResources', 'IAM Roles', 'Dashboard', 'RG', 'Workspaces', 'User Assigned Identities',
+        skip = {'AllResources', 'IAM Roles', 'Dashboard', 'RG', 'Workspaces', 'User Assigned Identities', 'Subscriptions', 'Truncated Cells',
                 'Scheduled Query Rules', 'Activity Log Alerts', 'Metric Alerts', 'Action Group', 'Smart Detector Alert Rules'}
-        ws_rows = b.sheet('Workspaces')
+        ws_rows = self.rows_of_type('microsoft.operationalinsights/workspaces') or b.sheet('Workspaces')
         ws_names = {str(r['Name']).lower(): r['Name'] for r in ws_rows}
         mi_rows = b.sheet('User Assigned Identities')
         mi_names = {str(r['Name']).lower(): r['Name'] for r in mi_rows}
@@ -921,6 +969,8 @@ class _Inventory:
             if sheet in skip or sheet.startswith(('High-Level', 'Low-Level')) or sheet.endswith(('_Quota', '_Quot', 'Quota')):
                 continue
             for r in b.sheet(sheet):
+                if not r.get('Name'):
+                    continue
                 who = f"{r['Name']} ({sheet})"
                 for w in re.findall(r'operationalinsights/workspaces/([^/\'"\s,}\]]+)', r.text, re.I):
                     if w.lower() in ws_names:
@@ -957,10 +1007,53 @@ class _Inventory:
             for w in dests:
                 if w in ws_names:
                     self.law_dcrs[w].append(dcr)
+        # diagnostic settings (collected per resource): resource -> workspace / storage / event hub
+        for r in self.rows_of_type('microsoft.insights/diagnosticsettings'):
+            ws = str(r.g('Workspace Name') or '').lower()
+            if ws in ws_names:
+                self.law_links[ws].add(f"{r.g('Target Resource Name') or r['Name']} (diagnostic setting)")
+        # Application Insights: component -> workspace, and the apps it monitors. Apps link through the collector's
+        # 'App Insights Component Name' column, else the hidden-link tags Azure writes on the app (resource id, or
+        # the connection string / instrumentation key matched to the component's key).
+        comps = self.rows_of_type('microsoft.insights/components') or b.sheet('Application Insights')
+        by_key = {}
+        for c in comps:
+            for k in (c.g('Instrumentation Key'), c.g('App Id'), c.g('Application Id')):
+                if k and '***' not in str(k):
+                    by_key[str(k).lower()] = c['Name']
+        comp_names = {str(c['Name']).lower(): c['Name'] for c in comps}
+        apps_of = collections.defaultdict(list)
+        for r in self.rows_of_type('microsoft.web/sites') or b.sheet('App Service'):
+            comp = r.g('App Insights Component Name')
+            if not comp:
+                m = re.search(r'microsoft\.insights/components/([^"\'/\s]+)', r.text, re.I)
+                comp = comp_names.get(m.group(1).lower()) if m else None
+            if not comp:
+                for k in re.findall(r'InstrumentationKey=([0-9a-f-]{36})|instrumentation-key[^0-9a-f]{0,12}([0-9a-f-]{36})', r.text, re.I):
+                    comp = by_key.get((k[0] or k[1]).lower())
+                    if comp:
+                        break
+            if comp:
+                apps_of[str(comp).lower()].append(r['Name'])
+                self.markers[('App Service', str(r['Name']).lower())].append(
+                    (_icon('devops/Application_Insights'), f'Monitored by Application Insights {comp}'))
+        self.law_ai = collections.defaultdict(list)       # workspace (lower) -> [component]
+        self.ai_classic = collections.defaultdict(list)   # subscription -> [component without a workspace]
+        for c in comps:
+            ws = (re.findall(r'workspaces/([^/\'"\s]+)', str(c.g('Workspace Resource Id') or ''), re.I)
+                  or [c.g('Workspace Resource Name')])[0]
+            ai = dict(name=c['Name'], apps=sorted(apps_of.get(str(c['Name']).lower(), [])),
+                      kind=str(c.g('Application Type', 'Application_ Type', 'Kind') or 'web'),
+                      retention=str(c.g('Retention In Days') or ''), sampling=str(c.g('Sampling Percentage') or ''))
+            if ws and str(ws).lower() in ws_names:
+                self.law_ai[str(ws).lower()].append(ai)
+            else:
+                self.ai_classic[self.sub_of_row(c)].append(ai)
         self.law_cards = collections.defaultdict(list)    # subscription id -> [(name, sorted links)]
         for r in ws_rows:
             self.law_cards[self.sub_of_row(r)].append((r['Name'], sorted(x for x in self.law_links[str(r['Name']).lower()]
-                                                                         if not x.endswith('(Data Collection Rules)'))))
+                                                                         if not x.endswith(('(Data Collection Rules)',
+                                                                                            '(Application Insights)')))))
         self.mi_cards = collections.defaultdict(list)
         for r in mi_rows:
             links = sorted(self.mi_links[str(r['Name']).lower()])
@@ -1322,8 +1415,9 @@ class _Builder:
                 self.cell_of[('icon', lab.split('<br>')[0].lower())] = iid
                 # public IP / NIC-level NSG markers: small icons stacked beside the resource icon
                 res = inv.item_res.get((name.lower(), s.lower(), lab))
-                for j, (mic, mtip) in enumerate(inv.markers.get(res, [])[:2] if res else []):
-                    d.cell(sid, '', MARKER.format(mic), ix + 42, iy + j * 20, 16, 16, tooltip=mtip)
+                for j, (mic, mtip) in enumerate(inv.markers.get(res, [])[:4] if res else []):
+                    mx, my = (ix + 42, iy + j * 20) if j < 2 else (ix - 18, iy + (j - 2) * 20)
+                    d.cell(sid, '', MARKER.format(mic), mx, my, 16, 16, tooltip=mtip)
         return vid
 
     # ----- resource strip
@@ -1370,6 +1464,43 @@ class _Builder:
 
     MAX_CARDS = 12
 
+    def _governance_cards(self, sid):
+        inv = self.inv
+        g = inv.gov.get(sid)
+        cards = []
+        if g and g['defender']:
+            on = [n for n, t in g['defender'] if t.lower() == 'standard']
+            off = [n for n, t in g['defender'] if t.lower() != 'standard']
+            cards.append(('security/Azure_Defender', f"Defender for Cloud: {len(on)}/{len(g['defender'])} plans on",
+                          f"off: {self._listing(off, 3)}" if off else 'all plans on',
+                          'Defender plans\n  On: ' + (', '.join(on) or 'none') + '\n  Off: ' + (', '.join(off) or 'none')))
+        if g and g['policy']:
+            nc = sorted(g['policy'], key=lambda x: -x['noncompliant'])
+            total = sum(x['noncompliant'] for x in nc)
+            cards.append(('management_governance/Policy', f"Azure Policy: {len(nc)} assignment(s)",
+                          f"{total} non-compliant resource evaluations" + (f" · worst: {nc[0]['name']}" if total else ''),
+                          'Policy assignments (non-compliant / evaluated):\n  ' +
+                          '\n  '.join(f"{x['name']}: {x['noncompliant']}/{x['evaluated']}"
+                                       f"{' (not enforced)' if x['mode'].lower() == 'donotenforce' else ''}" for x in nc[:40])))
+        if g and g['locks']:
+            levels = collections.Counter(x['level'] for x in g['locks'])
+            cards.append(('management_governance/Customer_Lockbox_for_MS_Azure', f"Resource locks: {len(g['locks'])}",
+                          ', '.join(f'{v} {k}' for k, v in levels.items()),
+                          'Locks:\n  ' + '\n  '.join(f"{x['level']} on {x['ttype']} {x['target']}" for x in g['locks'][:60])))
+        vms = [r['Name'] for r in inv.b.sheet('Virtual Machines') if inv.sub_of_row(r) == sid
+               and not str(r['Name']).lower().startswith('aks-')]
+        if inv.has_backup_data:
+            items = g['backup'] if g else []
+            failed = [x for x in items if x['status'] and x['status'].lower() not in ('completed', 'success', 'healthy')]
+            missing = [v for v in vms if v.lower() not in inv.backed_up]
+            if items or missing:
+                cards.append(('other/Backup_Vault', f"Backup: {len(items)} protected item(s)",
+                              (f"{len(failed)} last backup not OK · " if failed else '') +
+                              (f"{len(missing)} VM(s) not backed up" if missing else 'all VMs backed up'),
+                              'Protected:\n  ' + '\n  '.join(f"{x['name']} ({x['vault']}): {x['status'] or x['state']}" for x in items[:40]) +
+                              ('\nVMs with no backup:\n  ' + '\n  '.join(missing) if missing else '')))
+        return cards
+
     def _cap(self, cards, what):
         """Keep panels short: the first MAX_CARDS - 1 cards, then one '+N more' card listing the rest."""
         if len(cards) <= self.MAX_CARDS:
@@ -1400,30 +1531,60 @@ class _Builder:
             groups.setdefault(kind, (ic, []))[1].append((n, why))
         stale = [(ic, f'{kind} ({len(items)})', self._listing([n for n, _ in items], 3),
                   f'{kind}:\n  ' + '\n  '.join(f'{n} - {w}' for n, w in items)) for kind, (ic, items) in groups.items()]
+        gov = self._governance_cards(sid)
         return [p for p in (
             ('Log Analytics workspaces - what sends data to each (hover for the full list)',
              'fillColor=#F4F9FF;strokeColor=#2E86C1;dashed=1;align=left;', law),
             ('User-assigned managed identities - what each is assigned to (hover for the full list)',
              'fillColor=#F7FBF4;strokeColor=#5D9C3B;dashed=1;align=left;', mi),
+            ('Governance - Defender for Cloud, Azure Policy, resource locks, backup (hover for details)',
+             'fillColor=#F5F3FA;strokeColor=#7B4FB5;dashed=1;align=left;', gov),
             ('Stale - not attached to anything (unattached NSGs, public IPs, NICs, disks, unassigned identities)',
              'fillColor=#FFF8F0;strokeColor=#C55A11;dashed=1;align=left;fontColor=#C55A11;', stale),
         ) if p[2]]
 
     # ----- monitoring: data collection rules (left) -> Log Analytics workspace (right), one arrow per DCR
     MON_ROWS = 16
+    AI_SINGLE = 2      # a workspace with more Application Insights than this gets one grouped row
 
     def _monitoring(self, parent, sid, x, y, w, measure=False):
         """One row per data collection rule:  associated resources -> DCE (when the rule uses one) -> DCR ->
         Log Analytics workspace (one card per workspace, spanning its rules). Workspaces with no rule get a row of
         their own listing their other sources (App Insights, AKS, flow logs...)."""
         inv = self.inv
-        groups = [(ws, links, inv.law_dcrs.get(str(ws).lower(), [])) for ws, links in inv.law_cards.get(sid, [])]
+        # each workspace's rows: its data collection rules, then the Application Insights components sending to it
+        def ai_rows(comps):
+            # up to AI_SINGLE components get a row each; more collapse into one row so every component is counted
+            if len(comps) <= self.AI_SINGLE:
+                return [dict(a_, kind='ai') for a_ in comps]
+            return [dict(kind='aig', name=f'{len(comps)} Application Insights', comps=comps)]
+        groups = [(ws, links, [dict(d_, kind='dcr') for d_ in inv.law_dcrs.get(str(ws).lower(), [])] +
+                   ai_rows(inv.law_ai.get(str(ws).lower(), [])))
+                  for ws, links in inv.law_cards.get(sid, [])]
+        # workspaces with App Insights first, busiest first, so the cap drops the empty ones
+        groups.sort(key=lambda g_: -sum(len(x_.get('comps', [x_])) for x_ in g_[2] if x_['kind'] != 'dcr'))
+        if inv.ai_classic.get(sid):
+            groups.append((None, [], ai_rows(inv.ai_classic[sid])))
         if not groups:
             return 0
+        def groups_dcr(ws_):
+            return [x_ for g_ in groups if g_[0] == ws_ for x_ in g_[2]]
         rows, n = [], 0
         for ws, links, dcrs in groups:
             if n >= self.MON_ROWS:
                 break
+            ais = [x_ for x_ in dcrs if x_['kind'] != 'dcr']
+            if len(dcrs) > self.MON_ROWS - n and len(ais) > 1:
+                # about to be cut: fold this workspace's App Insights into one row so none are dropped
+                comps = [c_ for x_ in ais for c_ in x_.get('comps', [x_])]
+                dcrs = [x_ for x_ in dcrs if x_['kind'] == 'dcr'] + [
+                    dict(kind='aig', name=f'{len(comps)} Application Insights', comps=comps)]
+                agg = dcrs[-1:]
+                dcrs = dcrs[:max(0, self.MON_ROWS - n - 1)] + agg if len(dcrs) > self.MON_ROWS - n else dcrs
+                more_dcr = sum(1 for x_ in groups_dcr(ws) if x_['kind'] == 'dcr') - sum(1 for x_ in dcrs if x_['kind'] == 'dcr')
+                rows.append((ws, links, dcrs, more_dcr))
+                n += len(dcrs)
+                continue
             take = dcrs[:self.MON_ROWS - n]
             rows.append((ws, links, take, len(dcrs) - len(take)))
             n += max(1, len(take))
@@ -1435,7 +1596,7 @@ class _Builder:
         GAPX = 40
         cw = int(max(150, min(300, (w - 20 - 3 * GAPX) / 4)))
         cols = [10 + i * (cw + GAPX) for i in range(4)]           # resources | DCE | DCR | workspace
-        pid = d.cell(parent, 'Monitoring - resources -> data collection endpoint -> data collection rule -> Log Analytics workspace',
+        pid = d.cell(parent, 'Monitoring - resources -> DCE -> data collection rule / Application Insights -> Log Analytics workspace',
                      BOX + 'fillColor=#F4F9FF;strokeColor=#2E86C1;dashed=1;fontStyle=1;fontSize=11;align=left;', x, y, w, h)
         CARD = BOX + 'fillColor=#FFFFFF;strokeColor=#BDBDBD;fontSize=9;spacingLeft=34;verticalAlign=middle;'
         GREY = 'text;html=1;fontSize=8;fontColor=#9E9E9E;align=center;'
@@ -1443,14 +1604,30 @@ class _Builder:
         for ws, links, dcrs, more in rows:
             span = max(1, len(dcrs))
             wh = span * ROW - 10
+            n_dcr = sum(1 for x_ in dcrs if x_['kind'] == 'dcr')
+            n_ai = sum(len(x_.get('comps', [x_])) for x_ in dcrs if x_['kind'] != 'dcr')
+            ai_names = [c_['name'] for x_ in dcrs if x_['kind'] != 'dcr' for c_ in x_.get('comps', [x_])]
             other = f'also from {len(links)}: {self._listing(links, 3)}' if links else ('' if dcrs else 'no connected resource found')
-            wtip = (f'Workspace {ws}\nData collection rules: ' + (', '.join(x_['name'] for x_ in dcrs) or 'none') +
-                    ('\nOther sources:\n  ' + '\n  '.join(links) if links else ''))
-            wc = d.cell(pid, f"<b>{ws}</b><br><font color='#555555'>{len(dcrs)} DCR(s){' · ' + other if other else ''}"
-                             f"{' · +' + str(more) + ' more DCRs' if more else ''}</font>", CARD, cols[3], yy, cw, wh, tooltip=wtip)
+            if ws is None:
+                wc = d.cell(pid, "<b>no Log Analytics workspace</b><br><font color='#B9770E'>classic Application Insights "
+                                 "(retires - migrate to workspace-based)" + (f' · +{more} more' if more else '') + "</font>", CARD, cols[3], yy, cw, wh,
+                            tooltip='Application Insights components that do not send to a Log Analytics workspace')
+            else:
+                wtip = (f'Workspace {ws}\nData collection rules: ' + (', '.join(x_['name'] for x_ in dcrs if x_['kind'] == 'dcr') or 'none') +
+                        '\nApplication Insights: ' + (', '.join(ai_names) or 'none') +
+                        ('\nOther sources:\n  ' + '\n  '.join(links) if links else ''))
+                wc = d.cell(pid, f"<b>{ws}</b><br><font color='#555555'>{n_dcr} DCR(s){' · ' + str(n_ai) + ' App Insights' if n_ai else ''}"
+                                 f"{' · ' + other if other else ''}{' · +' + str(more) + ' more' if more else ''}</font>",
+                            CARD, cols[3], yy, cw, wh, tooltip=wtip)
             d.cell(wc, '', MARKER.format(_icon('analytics/Log_Analytics_Workspaces')), 6, wh / 2 - 10, 20, 20)
             for i, dcr in enumerate(dcrs):
                 top = yy + i * ROW
+                if dcr['kind'] == 'ai':
+                    self._ai_row(pid, dcr, wc, ws, top, yy, wh, cols, cw, CARD, GREY)
+                    continue
+                if dcr['kind'] == 'aig':
+                    self._ai_group_row(pid, dcr['comps'], wc, ws, top, yy, wh, cols, cw, CARD, GREY)
+                    continue
                 # data collection rule
                 dtip = f"DCR {dcr['name']} -> {ws}\nCollects: {', '.join(dcr['collects']) or 'n/a'}" + (
                     f"\nEndpoint: {dcr['dce']}" if dcr['dce'] else '\nNo data collection endpoint (agents send directly)')
@@ -1478,8 +1655,52 @@ class _Builder:
                            GREY, cols[0], top + 14, cw, 14)
             yy += span * ROW
         if len(groups) > len(rows):
-            d.cell(pid, f'+{len(groups) - len(rows)} more workspaces', 'text;html=1;fontSize=9;align=left;', 10, yy - 4, 300, 14)
+            hidden = groups[len(rows):]
+            n_hidden_ai = sum(len(x_.get('comps', [x_])) for g_ in hidden for x_ in g_[2] if x_['kind'] != 'dcr')
+            d.cell(pid, f'+{len(hidden)} more workspaces' + (f' ({n_hidden_ai} more Application Insights)' if n_hidden_ai else ''),
+                   'text;html=1;fontSize=9;align=left;', 10, yy - 4, 400, 14)
         return pid
+
+    def _ai_group_row(self, pid, comps, wc, ws, top, yy, wh, cols, cw, CARD, GREY):
+        """apps (left) -> N Application Insights components (DCR column) -> workspace, for workspaces with many."""
+        d = self.d
+        names = sorted(c_['name'] for c_ in comps)
+        apps = sorted({a_ for c_ in comps for a_ in c_['apps']})
+        linked = sum(1 for c_ in comps if c_['apps'])
+        tip = (f"{len(comps)} Application Insights -> {ws or 'no workspace (classic)'}\n" +
+               '\n'.join(f"  {c_['name']}" + (f" <- {', '.join(c_['apps'])}" if c_['apps'] else '')
+                         for c_ in sorted(comps, key=lambda c_: c_['name'])))
+        ac = d.cell(pid, f"<b>{len(comps)} Application Insights</b><br><font color='#555555'>{self._listing(names, 2)}</font>",
+                    CARD, cols[2], top, cw, 42, tooltip=tip)
+        d.cell(ac, '', MARKER.format(_icon('devops/Application_Insights')), 6, 11, 20, 20)
+        d.edge(ac, wc, 'sends to' if ws else '', 'strokeColor=#2E86C1;fontSize=8;', exit=(1, 0.5), entry=(0, (top + 21 - yy) / wh))
+        if apps:
+            rc = d.cell(pid, f"<b>{len(apps)} app(s)</b><br><font color='#555555'>{linked} of {len(comps)} components linked · "
+                             f"{self._listing(apps, 2)}</font>", CARD, cols[0], top, cw, 42,
+                        tooltip='Monitored apps:\n  ' + '\n  '.join(apps))
+            d.cell(rc, '', MARKER.format(_icon('containers/App_Services')), 6, 11, 20, 20)
+            d.edge(rc, ac, '', 'strokeColor=#2E86C1;', exit=(1, 0.5), entry=(0, 0.5))
+        else:
+            d.cell(pid, 'no app linked in the inventory', GREY, cols[0], top + 14, cw, 14)
+
+    def _ai_row(self, pid, ai, wc, ws, top, yy, wh, cols, cw, CARD, GREY):
+        """apps (left) -> Application Insights component (DCR column) -> workspace."""
+        d = self.d
+        kind = ai['kind'] if ai['kind'].lower() not in ('ai', 'web', '') else ''   # 'ai'/'web' are just the resource kind
+        detail = ' · '.join(x for x in (kind, f"{ai['retention']} d retention" if ai['retention'] else '',
+                                         f"{ai['sampling']}% sampling" if ai['sampling'] not in ('', '100', '100.0') else '') if x)
+        ac = d.cell(pid, f"<b>{ai['name']}</b><br><font color='#555555'>Application Insights · {detail}</font>", CARD, cols[2], top, cw, 42,
+                    tooltip=f"Application Insights {ai['name']} -> {ws or 'no workspace (classic)'}\nMonitors: " +
+                            (', '.join(ai['apps']) or 'no app linked in the inventory'))
+        d.cell(ac, '', MARKER.format(_icon('devops/Application_Insights')), 6, 11, 20, 20)
+        d.edge(ac, wc, 'sends to' if ws else '', 'strokeColor=#2E86C1;fontSize=8;', exit=(1, 0.5), entry=(0, (top + 21 - yy) / wh))
+        if ai['apps']:
+            rc = d.cell(pid, f"<b>{len(ai['apps'])} app(s)</b><br><font color='#555555'>{self._listing(ai['apps'], 3)}</font>",
+                        CARD, cols[0], top, cw, 42, tooltip='Monitored apps:\n  ' + '\n  '.join(ai['apps']))
+            d.cell(rc, '', MARKER.format(_icon('containers/App_Services')), 6, 11, 20, 20)
+            d.edge(rc, ac, '', 'strokeColor=#2E86C1;', exit=(1, 0.5), entry=(0, 0.5))
+        else:
+            d.cell(pid, 'no app linked in the inventory', GREY, cols[0], top + 14, cw, 14)
 
     # ----- subscription box (key = (subscription id, region))
     def _subscription(self, parent, key, x, y, measure=False):
@@ -1574,7 +1795,8 @@ class _Builder:
     def _region_boxes(self, loc):
         inv = self.inv
         subs = [s for s in inv.sub_name if any(v['sub'] == s and v['loc'] == loc for v in inv.vnets.values())
-                or (self.sub_home.get(s) == loc and (inv.strip.get(s) or self._panels(s) or inv.law_cards.get(s)))]
+                or (self.sub_home.get(s) == loc and (inv.strip.get(s) or self._panels(s) or inv.law_cards.get(s)))
+                or (loc == self.primary and not inv.sub_count.get(s))]          # assessed but empty: drawn as an empty box
         hub = self.hub.get(loc)
         hub_sub = inv.vnets[hub]['sub'] if hub else None
         subs.sort(key=lambda s: (s != hub_sub, inv.sub_name.get(s, s).lower()))
@@ -2104,6 +2326,17 @@ class _Builder:
             notes.append(f'Subscriptions with no VNet: {", ".join(no_vnet)}.')
         if inv.unplaced_pe:
             notes.append('Private endpoints without a resolvable subnet: ' + ', '.join(inv.unplaced_pe[:6]) + '.')
+        off = sorted({n for g in inv.gov.values() for n, t in g['defender'] if t.lower() != 'standard'})
+        if off:
+            notes.append(f'Defender for Cloud plans not enabled: {", ".join(off[:8])}{" ..." if len(off) > 8 else ""}.')
+        if inv.has_backup_data:
+            vms = [r['Name'] for r in inv.b.sheet('Virtual Machines') if not str(r['Name']).lower().startswith('aks-')]
+            missing = [v for v in vms if v.lower() not in inv.backed_up]
+            if missing:
+                notes.append(f'{len(missing)} of {len(vms)} VMs have no backup: {", ".join(missing[:6])}{" ..." if len(missing) > 6 else ""}.')
+        trunc = inv.b.sheet('Truncated Cells')
+        if trunc:
+            notes.append(f'{len(trunc)} workbook cell(s) were cut at Excel\'s 32,767-character limit (see the Truncated Cells sheet).')
         return notes
 
 

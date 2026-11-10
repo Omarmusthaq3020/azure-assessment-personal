@@ -33,8 +33,10 @@ from config import (
     ExcelExportConfig,
     ResourceTypeFriendlyNames,
     AKSDetectionConfig,
-    PerformanceConfig
+    PerformanceConfig,
+    AssessmentCoverageConfig,
 )
+from concurrent.futures import ThreadPoolExecutor
 
 # Import hybrid analysis functions  
 from backend.hybrid_analysis_functions import (
@@ -76,7 +78,8 @@ def load_friendly_type_map():
     return friendly_map
 
 def camel_to_title(s):
-    return re.sub(r'(?<!^)(?=[A-Z])', ' ', s).title()
+    # collapse runs of spaces: 'Subnet Names' used to become 'Subnet  Names'
+    return re.sub(r' {2,}', ' ', re.sub(r'(?<!^)(?=[A-Z])', ' ', s).title()).strip()
 
 def convert_nsg_json_to_text(nsg_json):
     """
@@ -268,7 +271,7 @@ def _child_resource(item, rtype, parent, props):
     """Shape a child resource returned by the Front Door API like a Resource Graph row."""
     return {'id': item.get('id'), 'name': item.get('name'), 'type': rtype, 'location': 'global',
             'resourceGroup': parent.get('resourceGroup'), 'subscriptionId': parent.get('subscriptionId'),
-            'tags': {}, 'properties': props}
+            'tags': {}, 'properties': props, '_collected': True}
 
 
 def fetch_frontdoor_origins(resources, env=None):
@@ -323,37 +326,126 @@ def fetch_frontdoor_origins(resources, env=None):
         print('🚪 Front Door details fetched: ' + ', '.join(f'{v} {k}' for k, v in n.items()))
     return out
 
-def lift_link_names(resources):
-    """clean_columns drops nested '.id' columns, which loses the links the architecture diagram needs. Copy the
-    linked resource names into plain properties: a connection's gateway / on-prem site / ExpressRoute circuit, and a
-    compact one-line-per-route summary of each route table (the full JSON can exceed Excel's 32,767-char cell)."""
-    def leaf(ref):
-        return ((ref or {}).get('id') or '').split('/')[-1] or None
+def _leaf(ref):
+    """Last path segment of an ARM id (or of {'id': ...})."""
+    if isinstance(ref, dict):
+        ref = ref.get('id')
+    return ref.rstrip('/').split('/')[-1] if isinstance(ref, str) and ref.startswith('/subscriptions/') else None
 
+
+def _lift_ids(obj, depth=0):
+    """clean_columns drops every nested '.id' column, which loses the links between resources. For every reference
+    found ({'id': '/subscriptions/...'} or a '...Id' string), add a plain sibling holding the linked name:
+    'virtualNetworkGateway1' -> 'virtualNetworkGateway1Name', 'diskEncryptionSetId' -> 'diskEncryptionSetName',
+    lists of references -> '<key>Names' (comma separated)."""
+    if depth > 4 or not isinstance(obj, dict):
+        return
+    for key in list(obj.keys()):
+        val = obj[key]
+        if isinstance(val, dict):
+            name = _leaf(val) if set(val.keys()) <= {'id', 'resourceGroup'} else None
+            if name and f'{key}Name' not in obj:
+                obj[f'{key}Name'] = name
+            _lift_ids(val, depth + 1)
+        elif isinstance(val, list) and val and len(val) <= 200:
+            names = [_leaf(v) for v in val if isinstance(v, (dict, str))]
+            names = [n for n in names if n]
+            if names and all(isinstance(v, dict) and set(v.keys()) <= {'id', 'resourceGroup'} for v in val):
+                obj.setdefault(f'{key}Names', ', '.join(names))
+            for v in val[:50]:
+                _lift_ids(v, depth + 1)
+        elif isinstance(val, str) and key.lower().endswith('id') and key.lower() != 'id' and val.startswith('/subscriptions/'):
+            obj.setdefault(f'{key[:-2]}Name', _leaf(val))
+
+
+def _link_app_insights(resources):
+    """App Service / Functions -> their Application Insights component, from the hidden-link tags Azure writes on the
+    app (resource id, or only the connection string / instrumentation key). Runs before mask_secrets, because the
+    instrumentation key is the only link for some apps and is masked afterwards."""
+    comps = [r for r in resources if (r.get('type') or '').lower() == 'microsoft.insights/components']
+    by_key, by_name = {}, {}
+    for c in comps:
+        props = c.get('properties') or {}
+        for k in (props.get('InstrumentationKey'), props.get('instrumentationKey'), props.get('AppId'), props.get('appId')):
+            if k:
+                by_key[str(k).lower()] = c.get('name')
+        by_name[str(c.get('name')).lower()] = c.get('name')
+    for res in resources:
+        if not (res.get('type') or '').lower().startswith('microsoft.web/sites'):
+            continue
+        tags = res.get('tags') if isinstance(res.get('tags'), dict) else {}
+        found = None
+        for k, v in tags.items():
+            kl, v = k.lower(), str(v)
+            if kl.endswith('app-insights-resource-id'):
+                found = by_name.get(v.rstrip('/').split('/')[-1].lower(), v.rstrip('/').split('/')[-1])
+            elif kl.endswith(('app-insights-conn-string', 'app-insights-instrumentation-key')) and not found:
+                m = re.search(r'(?:InstrumentationKey=)?([0-9a-f-]{36})', v, re.I)
+                app = re.search(r'ApplicationId=([0-9a-f-]{36})', v, re.I)
+                found = (by_key.get(m.group(1).lower()) if m else None) or (by_key.get(app.group(1).lower()) if app else None)
+        if found:
+            res.setdefault('properties', {})['appInsightsComponentName'] = found
+            res['Application insights'] = 'Yes'
+
+
+def lift_link_names(resources):
+    """Keep what the diagram and readers need after clean_columns drops nested ids: the resource's own id, the names
+    of every linked resource, a connection's gateway / site / circuit, a private DNS link's zone + VNet, and a compact
+    one-line-per-route summary of each route table (the full JSON can exceed Excel's 32,767-character cell)."""
+    _link_app_insights(resources)
     for res in resources:
         rtype = (res.get('type') or '').lower()
+        if res.get('id'):
+            res['resourceId'] = res['id']
         props = res.get('properties')
         if not isinstance(props, dict):
             continue
-        if rtype == 'microsoft.network/connections':
-            for key in ('virtualNetworkGateway1', 'virtualNetworkGateway2', 'localNetworkGateway2', 'peer'):
-                name = leaf(props.get(key))
-                if name:
-                    props[f'{key}Name'] = name
-        elif rtype == 'microsoft.network/privatednszones/virtualnetworklinks':
-            # zone = parent in the link's id; VNet = the link's target
+        _lift_ids(props)
+        if rtype == 'microsoft.network/privatednszones/virtualnetworklinks':
             rid = res.get('id') or ''
             if '/privatednszones/' in rid.lower():
                 props['privateDnsZoneName'] = rid[rid.lower().index('/privatednszones/') + len('/privatednszones/'):].split('/')[0]
-            name = leaf(props.get('virtualNetwork'))
-            if name:
-                props['virtualNetworkName'] = name
+            if _leaf(props.get('virtualNetwork')):
+                props['virtualNetworkName'] = _leaf(props.get('virtualNetwork'))
         elif rtype == 'microsoft.network/routetables':
             props['routesSummary'] = '; '.join(
                 f"{r.get('name')}: {(r.get('properties') or {}).get('addressPrefix')} -> "
                 f"{(r.get('properties') or {}).get('nextHopType')}"
                 + (f" {(r.get('properties') or {}).get('nextHopIpAddress')}" if (r.get('properties') or {}).get('nextHopIpAddress') else '')
                 for r in props.get('routes') or [])
+
+
+def _sensitive(key):
+    k = re.sub(r'[_\-\s]', '', str(key).lower())
+    if k in ExcelExportConfig.SENSITIVE_KEY_EXCEPTIONS:
+        return False
+    if any(pat in k for pat in ExcelExportConfig.SENSITIVE_KEY_PATTERNS):
+        return True
+    return ExcelExportConfig.MASK_USERNAMES and any(k.endswith(pat) for pat in ExcelExportConfig.USERNAME_KEY_PATTERNS)
+
+
+def mask_secrets(obj, depth=0):
+    """Replace secret values (ExpressRoute service / authorization keys, custom-domain validation tokens, passwords,
+    connection strings, access keys, admin usernames ...) with '***masked***' before anything is written."""
+    if depth > 8:
+        return 0
+    masked = 0
+    if isinstance(obj, dict):
+        for key in list(obj.keys()):
+            val = obj[key]
+            # strings / numbers only (never booleans such as tokenStoreEnabled); 'token'-style keys only when the value
+            # is long enough to be a real secret
+            short_ok = len(str(val)) >= 12 or not re.search(r'token|authkey', str(key), re.I)
+            if (isinstance(val, (str, int)) and not isinstance(val, bool) and val not in ('', None) and short_ok
+                    and _sensitive(key) and not str(val).startswith('/subscriptions/')):
+                obj[key] = '***masked***'
+                masked += 1
+            elif isinstance(val, (dict, list)):
+                masked += mask_secrets(val, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            masked += mask_secrets(v, depth + 1)
+    return masked
 
 
 def fetch_dcr_associations(env=None, subscription_ids=None):
@@ -377,6 +469,7 @@ def fetch_dcr_associations(env=None, subscription_ids=None):
                 target = (a.get('id') or '').split('/providers/Microsoft.Insights/dataCollectionRuleAssociations/')[0]
                 parts = target.split('/providers/')[-1].split('/') if '/providers/' in target else []
                 out.append({
+                    '_collected': True,
                     'id': a.get('id'), 'name': a.get('name'), 'type': 'microsoft.insights/datacollectionruleassociations',
                     'location': 'global', 'resourceGroup': a.get('resourceGroup'), 'subscriptionId': a.get('subscriptionId'),
                     'tags': {}, 'properties': {
@@ -392,6 +485,196 @@ def fetch_dcr_associations(env=None, subscription_ids=None):
         print(f"   ⚠️ DCR association query failed: {getattr(e, 'stderr', e)}")
     if out:
         print(f"📈 DCR associations fetched: {len(out)}")
+    return out
+
+
+def _arg_query(query, env=None, subscription_ids=None, label='query'):
+    """Run a paginated Resource Graph query (any table); returns [] on failure."""
+    out, skip_token = [], None
+    try:
+        while True:
+            cmd = ['az', 'graph', 'query', '-q', query, '--first', str(AzureResourceGraphConfig.BATCH_SIZE), '--output', 'json']
+            if subscription_ids:
+                cmd.extend(['--subscriptions'] + list(subscription_ids))
+            if skip_token:
+                cmd.extend(['--skip-token', skip_token])
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, env=env)
+            body = json.loads(result.stdout)
+            out.extend(body.get('data', []))
+            skip_token = body.get('skip_token')
+            if not skip_token:
+                return out
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        print(f"   ⚠️ {label} failed: {str(getattr(e, 'stderr', e))[:200]}")
+        return out
+
+
+def _pseudo(rid, name, rtype, sub, rg, props, location='global'):
+    # '_collected': not a movable resource (settings / links collected for the report) - kept out of the migration plan
+    return {'id': rid, 'name': name, 'type': rtype, 'location': location, 'resourceGroup': rg,
+            'subscriptionId': sub, 'tags': {}, 'properties': props, '_collected': True}
+
+
+def _parent_of(rid, marker):
+    """'/subscriptions/../providers/X/y/name/providers/Microsoft.Insights/...' -> ('name', 'X/y')."""
+    target = rid.split(marker)[0] if marker in rid else rid
+    parts = target.split('/providers/')[-1].split('/') if '/providers/' in target else []
+    return (target.rstrip('/').split('/')[-1] or None), ('/'.join(parts[:2]) if len(parts) >= 2 else None)
+
+
+def fetch_diagnostic_settings(resources, env=None):
+    """Diagnostic settings (where each resource sends its logs / metrics) are not in Resource Graph; fetch them per
+    resource for the types in AssessmentCoverageConfig.DIAGNOSTIC_TYPES, in parallel and capped."""
+    if not AssessmentCoverageConfig.ENABLE_DIAGNOSTIC_SETTINGS:
+        return []
+    wanted = set(AssessmentCoverageConfig.DIAGNOSTIC_TYPES)
+    targets = [r for r in resources if (r.get('type') or '').lower() in wanted and r.get('id')]
+    if len(targets) > AssessmentCoverageConfig.MAX_DIAGNOSTIC_RESOURCES:
+        print(f"   ⚠️ {len(targets)} resources support diagnostic settings; checking the first "
+              f"{AssessmentCoverageConfig.MAX_DIAGNOSTIC_RESOURCES} (MAX_DIAGNOSTIC_RESOURCES)")
+        targets = targets[:AssessmentCoverageConfig.MAX_DIAGNOSTIC_RESOURCES]
+
+    def one(res):
+        items = []
+        try:
+            result = subprocess.run(
+                ['az', 'rest', '--method', 'get', '--url',
+                 f"https://management.azure.com{res['id']}/providers/Microsoft.Insights/diagnosticSettings?api-version=2021-05-01-preview",
+                 '--output', 'json'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, env=env, timeout=60)
+            settings = json.loads(result.stdout or '{}').get('value', [])
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            return items
+        for ds in settings:
+            pr = ds.get('properties') or {}
+            items.append(_pseudo(ds.get('id'), ds.get('name'), 'microsoft.insights/diagnosticsettings', res.get('subscriptionId'),
+                                 res.get('resourceGroup'), {
+                                     'targetResourceName': res.get('name'), 'targetResourceType': res.get('type'),
+                                     'workspaceName': _leaf(pr.get('workspaceId')), 'storageAccountName': _leaf(pr.get('storageAccountId')),
+                                     'eventHubNamespaceName': _leaf(pr.get('eventHubAuthorizationRuleId').split('/authorizationrules/')[0]
+                                                                    if pr.get('eventHubAuthorizationRuleId') else None),
+                                     'logCategories': ', '.join(l.get('category') or l.get('categoryGroup') or '' for l in pr.get('logs') or []
+                                                                if l.get('enabled')),
+                                     'metricsEnabled': any(m.get('enabled') for m in pr.get('metrics') or []),
+                                 }))
+        return items
+
+    def settings_to_items(res, settings):
+        items = []
+        for ds in settings:
+            pr = ds.get('properties') or {}
+            items.append(_pseudo(ds.get('id'), ds.get('name'), 'microsoft.insights/diagnosticsettings', res.get('subscriptionId'),
+                                 res.get('resourceGroup'), {
+                                     'targetResourceName': res.get('name'), 'targetResourceType': res.get('type'),
+                                     'workspaceName': _leaf(pr.get('workspaceId')), 'storageAccountName': _leaf(pr.get('storageAccountId')),
+                                     'eventHubNamespaceName': _leaf(pr.get('eventHubAuthorizationRuleId').split('/authorizationrules/')[0]
+                                                                    if pr.get('eventHubAuthorizationRuleId') else None),
+                                     'logCategories': ', '.join(l.get('category') or l.get('categoryGroup') or '' for l in pr.get('logs') or []
+                                                                if l.get('enabled')),
+                                     'metricsEnabled': any(m.get('enabled') for m in pr.get('metrics') or []),
+                                 }))
+        return items
+
+    def batch(chunk):
+        """One ARM batch call for up to 20 resources; resources the batch could not answer fall back to one call each."""
+        body = {'requests': [{'httpMethod': 'GET', 'name': str(i),
+                              'url': f"{r['id']}/providers/Microsoft.Insights/diagnosticSettings?api-version=2021-05-01-preview"}
+                             for i, r in enumerate(chunk)]}
+        items, answered = [], set()
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+                json.dump(body, fh)
+                tmp = fh.name
+            result = subprocess.run(['az', 'rest', '--method', 'post', '--url',
+                                     'https://management.azure.com/batch?api-version=2020-06-01', '--body', f'@{tmp}',
+                                     '--output', 'json'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    check=True, env=env, timeout=120)
+            for resp in json.loads(result.stdout or '{}').get('responses', []):
+                idx = int(resp.get('name', -1))
+                if 0 <= idx < len(chunk) and resp.get('httpStatusCode') in (200, 404):
+                    answered.add(idx)
+                    items += settings_to_items(chunk[idx], (resp.get('content') or {}).get('value', []))
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError):
+            pass
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+        for idx, r in enumerate(chunk):
+            if idx not in answered:
+                items += one(r)
+        return items
+
+    out = []
+    chunks = [targets[i:i + 20] for i in range(0, len(targets), 20)]
+    print(f"🩺 Fetching diagnostic settings for {len(targets)} resources ({len(chunks)} batch calls)...")
+    done, next_mark = 0, 25
+    with ThreadPoolExecutor(max_workers=max(1, min(4, AssessmentCoverageConfig.DIAGNOSTIC_WORKERS))) as pool:
+        for items in pool.map(batch, chunks):
+            out.extend(items)
+            done += 1
+            while chunks and done * 100 // len(chunks) >= next_mark and next_mark < 100:
+                print(f"🩺 Diagnostic settings {next_mark}% done")
+                next_mark += 25
+    print(f"🩺 Diagnostic settings: {len(out)} on {len(targets)} resources checked")
+    return out
+
+
+def fetch_governance(sub_ids, env=None):
+    """Policy assignments with non-compliance counts, resource locks, Defender for Cloud plans and backup-protected
+    items - the governance picture a migration assessment needs. Each part is best-effort."""
+    out = []
+    print("🛡️ Fetching governance data (policy, locks, Defender, backup)...")
+    if AssessmentCoverageConfig.ENABLE_POLICY:
+        states = {}
+        for r in _arg_query("policyresources | where type =~ 'microsoft.policyinsights/policystates' "
+                            "| summarize evaluated = count(), nonCompliant = countif(tostring(properties.complianceState) =~ 'NonCompliant') "
+                            "by assignment = tolower(tostring(properties.policyAssignmentId))", env, sub_ids, 'policy compliance query'):
+            states[r.get('assignment')] = r
+        for a in _arg_query("policyresources | where type =~ 'microsoft.authorization/policyassignments' "
+                            "| project id, name, subscriptionId, resourceGroup, displayName = tostring(properties.displayName), "
+                            "enforcementMode = tostring(properties.enforcementMode), scope = tostring(properties.scope), "
+                            "definition = tostring(properties.policyDefinitionId)", env, sub_ids, 'policy assignment query'):
+            st = states.get((a.get('id') or '').lower(), {})
+            out.append(_pseudo(a.get('id'), a.get('name'), 'microsoft.authorization/policyassignments', a.get('subscriptionId'),
+                               a.get('resourceGroup'), {
+                                   'displayName': a.get('displayName'), 'enforcementMode': a.get('enforcementMode'),
+                                   'scope': a.get('scope'), 'policyDefinitionName': _leaf(a.get('definition')),
+                                   'isInitiative': '/policysetdefinitions/' in (a.get('definition') or '').lower(),
+                                   'evaluatedResources': st.get('evaluated', 0), 'nonCompliantResources': st.get('nonCompliant', 0)}))
+    if AssessmentCoverageConfig.ENABLE_LOCKS:
+        for sid in sub_ids or []:
+            for lk in _az_rest_list(f"/subscriptions/{sid}/providers/Microsoft.Authorization/locks?api-version=2020-05-01", env):
+                pr = lk.get('properties') or {}
+                target, ttype = _parent_of(lk.get('id') or '', '/providers/Microsoft.Authorization/locks')
+                rg = (lk.get('id') or '').split('/resourceGroups/')[1].split('/')[0] if '/resourceGroups/' in (lk.get('id') or '') else None
+                out.append(_pseudo(lk.get('id'), lk.get('name'), 'microsoft.authorization/locks', sid, rg, {
+                    'level': pr.get('level'), 'notes': pr.get('notes'), 'lockedResourceName': target if ttype else (rg or sid),
+                    'lockedResourceType': ttype or ('resource group' if rg else 'subscription')}))
+    if AssessmentCoverageConfig.ENABLE_DEFENDER:
+        for d in _arg_query("securityresources | where type =~ 'microsoft.security/pricings' "
+                            "| project id, name, subscriptionId, tier = tostring(properties.pricingTier), "
+                            "subPlan = tostring(properties.subPlan)", env, sub_ids, 'Defender plans query'):
+            out.append(_pseudo(d.get('id'), d.get('name'), 'microsoft.security/pricings', d.get('subscriptionId'), None,
+                               {'pricingTier': d.get('tier'), 'subPlan': d.get('subPlan') or None}))
+    if AssessmentCoverageConfig.ENABLE_BACKUP:
+        for bi in _arg_query("recoveryservicesresources | where type =~ "
+                             "'microsoft.recoveryservices/vaults/backupfabrics/protectioncontainers/protecteditems' "
+                             "| project id, name, subscriptionId, resourceGroup, source = tostring(properties.sourceResourceId), "
+                             "friendly = tostring(properties.friendlyName), state = tostring(properties.protectionState), "
+                             "lastStatus = tostring(properties.lastBackupStatus), lastTime = tostring(properties.lastBackupTime), "
+                             "policy = tostring(properties.policyName), workload = tostring(properties.workloadType)",
+                             env, sub_ids, 'backup items query'):
+            vault = (bi.get('id') or '').split('/vaults/')[1].split('/')[0] if '/vaults/' in (bi.get('id') or '') else None
+            out.append(_pseudo(bi.get('id'), bi.get('friendly') or bi.get('name'),
+                               'microsoft.recoveryservices/vaults/backupfabrics/protectioncontainers/protecteditems',
+                               bi.get('subscriptionId'), bi.get('resourceGroup'), {
+                                   'protectedResourceName': _leaf(bi.get('source')) or bi.get('friendly'),
+                                   'workloadType': bi.get('workload'), 'protectionState': bi.get('state'),
+                                   'lastBackupStatus': bi.get('lastStatus'), 'lastBackupTime': bi.get('lastTime'),
+                                   'backupPolicy': bi.get('policy'), 'vaultName': vault}))
+    print(f"🛡️ Governance: {sum(1 for x in out if x['type'].endswith('policyassignments'))} policy assignments, "
+          f"{sum(1 for x in out if x['type'].endswith('/locks'))} locks, {sum(1 for x in out if x['type'].endswith('pricings'))} "
+          f"Defender plans, {sum(1 for x in out if x['type'].endswith('protecteditems'))} backup items")
     return out
 
 
@@ -647,6 +930,20 @@ def enrich_vm_network_details(resources, nic_ip_map, env=None):
         res["Subnet Prefix"] = subnet_prefix or "None"  # CIDR
         res["Public IP"] = public_ip or "None"
 
+def _report_dir():
+    """Directory for generated workbooks: ExcelExportConfig.OUTPUT_DIR (the mounted data/ folder in Docker, so
+    reports survive container rebuilds), else the system temp dir when that is not writable."""
+    out = ExcelExportConfig.OUTPUT_DIR
+    try:
+        os.makedirs(out, exist_ok=True)
+        probe = os.path.join(out, f'.write_test_{uuid.uuid4().hex[:6]}')
+        open(probe, 'w').close()
+        os.remove(probe)
+        return out
+    except OSError:
+        return tempfile.gettempdir()
+
+
 def _export_empty_workbook(sub_map):
     """Write a valid, minimal workbook when a subscription has 0 resources.
 
@@ -656,7 +953,7 @@ def _export_empty_workbook(sub_map):
     """
     unique_id = str(uuid.uuid4())[:8]
     file_name = f"{ExcelExportConfig.FILE_NAME_PREFIX}_{datetime.now().strftime(ExcelExportConfig.FILE_NAME_DATE_FORMAT)}_{unique_id}.xlsx"
-    file_path = os.path.join(tempfile.gettempdir(), file_name)
+    file_path = os.path.join(_report_dir(), file_name)
     empty_df = pd.DataFrame(
         columns=["Name", "Resource Type", "Resource Group", "Location", "Subscription", "Type"]
     )
@@ -671,6 +968,29 @@ def _export_empty_workbook(sub_map):
                     value=f"Subscription: {name} ({sid}) - 0 resources")
     print(f"✅ Export complete: {file_path}")
     return file_path
+
+
+def _sheet_names(types, friendly_map):
+    """ARM type -> unique sheet name (<= 31 chars). Types sharing a friendly name get '(<provider>)' appended."""
+    base = {t: friendly_map.get(t, camel_to_title(t.split("/")[-1])).replace('!', '').replace('⚠️', '').replace('✅', '').replace('❌', '')
+            for t in types if t}
+    by_name = defaultdict(list)
+    for t, n in base.items():
+        by_name[n.lower()].append(t)
+    names, used = {}, {"allresources", "subscriptions", "truncated cells"}
+    for t in sorted(base):
+        n = base[t]
+        if len(by_name[n.lower()]) > 1:
+            n = f"{n} ({t.split('/')[0].replace('microsoft.', '')})"
+        cand = sanitize_sheet_name(n)
+        i = 2
+        while cand.lower() in used:                       # truncation to 31 chars can still collide
+            suffix = f"~{i}"
+            cand = sanitize_sheet_name(n)[:31 - len(suffix)] + suffix
+            i += 1
+        used.add(cand.lower())
+        names[t] = cand
+    return names
 
 
 def export_to_excel(resources, sub_map, friendly_map, schema_map):
@@ -690,16 +1010,27 @@ def export_to_excel(resources, sub_map, friendly_map, schema_map):
         if isinstance(res.get("tags"), dict):
             res["tags"] = json.dumps(res["tags"])
 
-    df_all = pd.DataFrame(resources)
+    # One sheet per ARM type with an unambiguous, unique name: types that share a friendly name ('Connections' is
+    # both microsoft.network/connections and microsoft.web/connections) get their provider appended, and names
+    # cut to Excel's 31 characters are de-duplicated.
+    sheet_of = _sheet_names({(r.get("type") or "").lower() for r in resources}, friendly_map)
+    for res in resources:
+        res["Sheet"] = sheet_of.get((res.get("type") or "").lower())
 
-    all_res_columns = ["name", "type", "resourceGroup", "location", "subscriptionId", "Type"]
+    df_all = pd.DataFrame(resources)
+    if "resourceId" not in df_all.columns:
+        df_all["resourceId"] = df_all.get("id")
+
+    all_res_columns = ["name", "type", "resourceGroup", "location", "subscriptionId", "Type", "Sheet", "resourceId"]
     all_res_renamed = {
         "name": "Name",
         "type": "Resource Type",
         "resourceGroup": "Resource Group",
         "location": "Location",
         "subscriptionId": "Subscription",
-        "Type": "Type"
+        "Type": "Type",
+        "Sheet": "Sheet",
+        "resourceId": "Resource Id",
     }
 
     df_all_res = df_all[all_res_columns].rename(columns=all_res_renamed)
@@ -707,7 +1038,7 @@ def export_to_excel(resources, sub_map, friendly_map, schema_map):
 
     unique_id = str(uuid.uuid4())[:8]
     file_name = f"{ExcelExportConfig.FILE_NAME_PREFIX}_{datetime.now().strftime(ExcelExportConfig.FILE_NAME_DATE_FORMAT)}_{unique_id}.xlsx"
-    file_path = os.path.join(tempfile.gettempdir(), file_name)
+    file_path = os.path.join(_report_dir(), file_name)
     print(f"💾 Saving report to: {file_path}")
     
     with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
@@ -726,6 +1057,12 @@ def export_to_excel(resources, sub_map, friendly_map, schema_map):
         
         ws_all.cell(row=last_row, column=1).font = Font(bold=True)
         ws_all.cell(row=last_row+1, column=1).font = Font(bold=True)
+
+        # every assessed subscription, including ones with no resources
+        counts = Counter((r.get("subscriptionId") or "").lower() for r in resources)
+        pd.DataFrame([{"Subscription Id": sid, "Subscription Name": name, "Resource Count": counts.get(sid.lower(), 0)}
+                      for sid, name in sub_map.items()]).to_excel(writer, sheet_name="Subscriptions", index=False)
+        truncated = []
 
         grouped = defaultdict(list)
         for res in resources:
@@ -803,16 +1140,13 @@ def export_to_excel(resources, sub_map, friendly_map, schema_map):
                     item["Publishing model"] = fxv.split("|")[0] if fxv and "|" in fxv else (fxv or "Code")
                     
                     # Application insights
-                    has_ins = "No"
+                    # tag keys come in lower case ('hidden-link: /app-insights-resource-id'); newer apps only carry the
+                    # connection string / instrumentation key tags. _link_app_insights has already resolved the name.
+                    linked = (props.get("appInsightsComponentName") if isinstance(props, dict) else None)
                     tags = item.get("tags", {})
-                    if isinstance(tags, dict):
-                        for k in tags.keys():
-                            if "App-Insights-Resource-Id" in k:
-                                has_ins = "Yes"
-                                break
-                    elif isinstance(tags, str) and "App-Insights-Resource-Id" in tags:
-                        has_ins = "Yes"
-                    item["Application insights"] = has_ins
+                    tag_text = json.dumps(tags).lower() if isinstance(tags, dict) else str(tags).lower()
+                    has_ins = "Yes" if linked or "app-insights-" in tag_text else "No"
+                    item["Application insights"] = f"Yes ({linked})" if linked else has_ins
 
                     item["Deployment Slot"] = "Yes" if "/slots/" in item.get("id", "").lower() else "No"
                     
@@ -924,8 +1258,22 @@ def export_to_excel(resources, sub_map, friendly_map, schema_map):
                 if any(k in col_lower for k in ['size', 'gb', 'count', 'memory']) and not is_sku_string_col:
                     df[col] = pd.to_numeric(df[col].astype(str).str.replace(' GB', '', case=False).replace('Unknown', '0').replace('', '0'), errors='coerce')
 
-            sheet_name = sanitize_sheet_name(friendly_map.get(res_type.lower(), res_type.split("/")[-1]).replace('!', '').replace('⚠️', '').replace('✅', '').replace('❌', ''))
+            sheet_name = sheet_of.get(res_type.lower()) or sanitize_sheet_name(res_type.split("/")[-1])
+            # Excel silently cuts a cell at 32,767 characters: cut it ourselves, mark it, and list it
+            limit = ExcelExportConfig.MAX_CELL_CHARS
+            for col in df.columns:
+                if df[col].dtype != 'object':
+                    continue
+                for idx, val in df[col].items():
+                    if isinstance(val, str) and len(val) > limit:
+                        marker = f" ...[TRUNCATED: {len(val)} chars, Excel cell limit {limit}]"
+                        df.at[idx, col] = val[:limit - len(marker)] + marker
+                        truncated.append({"Sheet": sheet_name, "Column": col,
+                                          "Resource": df.at[idx, name_col] if name_col else idx, "Original Length": len(val)})
             df[cols].to_excel(writer, sheet_name=sheet_name, index=False)
+        if truncated:
+            pd.DataFrame(truncated).to_excel(writer, sheet_name="Truncated Cells", index=False)
+            print(f"⚠️ {len(truncated)} cell(s) exceeded Excel's {ExcelExportConfig.MAX_CELL_CHARS}-character limit - see 'Truncated Cells'")
 
     print(f"✅ Export complete: {file_path}")
     return file_path
@@ -984,11 +1332,21 @@ def format_excel_with_openpyxl(file_path):
         for col_idx in sorted(cols_to_delete, reverse=True):
             ws.delete_cols(col_idx)
 
-        # Delete columns that are fully empty (row 2 to 11)
+        # Delete columns that are empty in EVERY row (checking only the first 10 rows used to drop sparse columns
+        # such as a disk's encryption set when the first disks had none)
         for col in reversed(range(1, ws.max_column + 1)):
-            col_cells = [ws.cell(row=r, column=col).value for r in range(2, 12)]
-            if all(c in (None, "") for c in col_cells):
+            if all(ws.cell(row=r, column=col).value in (None, "") for r in range(2, ws.max_row + 1)):
                 ws.delete_cols(col)
+
+        # Two columns can end up with the same title (a summary column and the raw property it came from):
+        # keep the first, label the others '(raw)'
+        seen = Counter()
+        for cell in ws[1]:
+            if cell.value:
+                key = str(cell.value).strip().lower()
+                seen[key] += 1
+                if seen[key] > 1:
+                    cell.value = f"{cell.value} (raw{'' if seen[key] == 2 else ' ' + str(seen[key] - 1)})"
 
         # Get last data row
         last_data_row = 1
@@ -1773,9 +2131,16 @@ def run_assessment(subscription_ids=None, env=None):
     # For now, let's filter the results based on the sub_map we just filtered.
     target_sub_ids = list(sub_map.keys()) if subscription_ids else None
     raw_resources = query_azure_resource_graph(env=env, subscription_ids=target_sub_ids)
+    print("🚪 Fetching Front Door details...")
     raw_resources += fetch_frontdoor_origins(raw_resources, env=env)
+    print("📈 Fetching DCR associations...")
     raw_resources += fetch_dcr_associations(env=env, subscription_ids=target_sub_ids)
+    raw_resources += fetch_diagnostic_settings(raw_resources, env=env)
+    raw_resources += fetch_governance(target_sub_ids or list(sub_map.keys()), env=env)
     lift_link_names(raw_resources)
+    n_masked = sum(mask_secrets(r) for r in raw_resources)
+    if n_masked:
+        print(f"🔒 Masked {n_masked} secret value(s) (keys, tokens, passwords, usernames) before export")
     print(f"🔍 Raw resources fetched: {len(raw_resources)}")
 
     # Diagnostic: per-type counts BEFORE filtering
@@ -1813,6 +2178,8 @@ def run_assessment(subscription_ids=None, env=None):
             continue
         # Hidden-type filter now tags instead of drops.
         matched_kw = next((kw for kw in exclude_keywords if kw in rtype), None)
+        if res.get("_collected"):
+            matched_kw = "collected-for-report"      # Front Door children, DCR associations, diagnostics, governance
         if matched_kw:
             res["is_hidden_type"] = True
             res["_hidden_reason"] = matched_kw

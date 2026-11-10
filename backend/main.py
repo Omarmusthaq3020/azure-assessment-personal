@@ -546,6 +546,11 @@ def _subscription_report_name(subscription_name: str) -> str:
 PARALLEL_PROGRESS_EVENTS = (
     ("Fetching subscription names", 5, "Authenticating"),
     ("Querying Azure Resource Graph", 15, "Fetching resources"),
+    ("Fetching Front Door details", 16, "Collecting Front Door details"),
+    ("Fetching DCR associations", 17, "Collecting DCR associations"),
+    ("Fetching diagnostic settings", 18, "Collecting diagnostic settings"),
+    ("Diagnostic settings 50% done", 20, "Collecting diagnostic settings"),
+    ("Fetching governance data", 23, "Collecting governance data"),
     ("Building NIC to Public IP map", 25, "Building network mappings"),
     ("Enriching VM resources", 30, "Enriching resources"),
     ("Exporting to Excel", 40, "Exporting workbook"),

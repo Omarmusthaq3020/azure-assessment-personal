@@ -228,6 +228,31 @@ class AzureQuotaConfig:
 # EXCEL EXPORT SETTINGS
 # ============================================================================
 
+class AssessmentCoverageConfig:
+    """Data collected outside Resource Graph's Resources table (each step is best-effort and can be switched off)."""
+    ENABLE_DIAGNOSTIC_SETTINGS = os.getenv("ENABLE_DIAGNOSTIC_SETTINGS", "true").lower() == "true"
+    # one REST call per resource: cap it, and run calls in parallel
+    MAX_DIAGNOSTIC_RESOURCES = int(os.getenv("MAX_DIAGNOSTIC_RESOURCES", "1500"))
+    DIAGNOSTIC_WORKERS = int(os.getenv("DIAGNOSTIC_WORKERS", "8"))
+    # resource types whose diagnostic settings are worth collecting (VMs/AKS nodes use DCRs instead)
+    DIAGNOSTIC_TYPES = (
+        "microsoft.keyvault/vaults", "microsoft.storage/storageaccounts", "microsoft.sql/servers/databases",
+        "microsoft.web/sites", "microsoft.containerservice/managedclusters", "microsoft.network/applicationgateways",
+        "microsoft.network/azurefirewalls", "microsoft.network/networksecuritygroups", "microsoft.network/loadbalancers",
+        "microsoft.network/publicipaddresses", "microsoft.network/virtualnetworkgateways", "microsoft.network/frontdoors",
+        "microsoft.cdn/profiles", "microsoft.apimanagement/service", "microsoft.eventhub/namespaces",
+        "microsoft.servicebus/namespaces", "microsoft.documentdb/databaseaccounts", "microsoft.cache/redis",
+        "microsoft.cache/redisenterprise", "microsoft.dbforpostgresql/flexibleservers", "microsoft.dbformysql/flexibleservers",
+        "microsoft.datafactory/factories", "microsoft.logic/workflows", "microsoft.containerregistry/registries",
+        "microsoft.recoveryservices/vaults", "microsoft.network/expressroutecircuits", "microsoft.cognitiveservices/accounts",
+        "microsoft.search/searchservices", "microsoft.app/managedenvironments", "microsoft.network/bastionhosts",
+    )
+    ENABLE_POLICY = os.getenv("ENABLE_POLICY", "true").lower() == "true"
+    ENABLE_LOCKS = os.getenv("ENABLE_LOCKS", "true").lower() == "true"
+    ENABLE_DEFENDER = os.getenv("ENABLE_DEFENDER", "true").lower() == "true"
+    ENABLE_BACKUP = os.getenv("ENABLE_BACKUP", "true").lower() == "true"
+
+
 class ExcelExportConfig:
     """Excel export and formatting configuration"""
     
@@ -254,6 +279,22 @@ class ExcelExportConfig:
     
     # Data Limits
     MAX_EMPTY_ROWS_TO_CHECK = 10
+    MAX_CELL_CHARS = 32767          # Excel's hard limit per cell; longer values are cut and listed in 'Truncated Cells'
+
+    # Where workbooks are written. Default: the project's data/ folder (mounted as a volume in Docker, so reports
+    # survive container rebuilds and stay downloadable); falls back to the system temp dir if it isn't writable.
+    OUTPUT_DIR = os.getenv("ASSESSMENT_OUTPUT_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+
+    # Secrets are never written to the workbook: any property whose key matches one of these (case-insensitive,
+    # ignoring '_' and '-') has its value replaced by "***masked***". Usernames are masked when MASK_USERNAMES is on.
+    SENSITIVE_KEY_PATTERNS = (
+        "servicekey", "authorizationkey", "validationtoken", "password", "connectionstring", "sharedkey",
+        "primarykey", "secondarykey", "accesskey", "sastoken", "clientsecret", "secretvalue", "instrumentationkey",
+        "privatekey", "certificatepassword", "sharedaccesskey", "authkey", "token", "connstring",
+    )
+    SENSITIVE_KEY_EXCEPTIONS = ("tokenendpoint", "tokenlifetime", "tokens")   # keys that look sensitive but are not
+    MASK_USERNAMES = os.getenv("MASK_USERNAMES", "true").lower() == "true"
+    USERNAME_KEY_PATTERNS = ("adminusername", "administratorlogin", "username")
     
     # Migration Plan Columns
     MIGRATION_PLAN_HEADERS = [
@@ -274,6 +315,11 @@ class ResourceTypeFriendlyNames:
         "microsoft.cdn/profiles/customdomains": "Front Door Custom Domains",
         "microsoft.cdn/profiles/afdendpoints/routes": "Front Door Routes",
         "microsoft.insights/datacollectionruleassociations": "Data Collection Rule Associations",
+        "microsoft.insights/diagnosticsettings": "Diagnostic Settings",
+        "microsoft.authorization/policyassignments": "Policy Assignments",
+        "microsoft.authorization/locks": "Resource Locks",
+        "microsoft.security/pricings": "Defender Plans",
+        "microsoft.recoveryservices/vaults/backupfabrics/protectioncontainers/protecteditems": "Backup Protected Items",
         "microsoft.dbformysql/flexibleservers": "MySQL Flexible Servers",
         "microsoft.dbforpostgresql/flexibleservers": "PostgreSQL Flexible Servers",
         "microsoft.insights/metricalerts": "Metric Alerts",
@@ -378,6 +424,13 @@ class AssessmentProgressConfig:
     PROGRESS_EVENTS = {
         "Fetching subscription names": (5, "Authenticating", "Fetching subscriptions..."),
         "Querying Azure Resource Graph": (15, "Fetching resources", "Querying Azure Resource Graph..."),
+        "Fetching Front Door details": (16, "Fetching resources", "Collecting Front Door routes and origins..."),
+        "Fetching DCR associations": (17, "Fetching resources", "Collecting data collection rule associations..."),
+        "Fetching diagnostic settings": (18, "Fetching resources", "Collecting diagnostic settings..."),
+        "Diagnostic settings 25% done": (19, "Fetching resources", "Collecting diagnostic settings (25%)..."),
+        "Diagnostic settings 50% done": (20, "Fetching resources", "Collecting diagnostic settings (50%)..."),
+        "Diagnostic settings 75% done": (21, "Fetching resources", "Collecting diagnostic settings (75%)..."),
+        "Fetching governance data": (23, "Fetching resources", "Collecting policy, locks, Defender and backup..."),
         "Building NIC to Public IP map": (25, "Fetching resources", "Building network mappings..."),
         "Enriching VM resources": (30, "Fetching resources", "Enriching resource details..."),
         "Loading friendly type mappings": (35, "Building dependency graph", "Loading resource metadata..."),
